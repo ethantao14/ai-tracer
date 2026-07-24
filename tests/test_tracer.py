@@ -13,7 +13,7 @@ def test_start_stop_records_a_simple_call():
     sample_function()
     calls = tracer.stop()
 
-    assert calls == [{"qualname": "sample_function"}]
+    assert calls == [{"qualname": "sample_function", "args": {}}]
 
 
 def test_ignores_calls_outside_target_dir(tmp_path):
@@ -34,8 +34,8 @@ def test_records_nested_calls_in_call_order():
     calls = tracer.stop()
 
     assert calls == [
-        {"qualname": "sample_caller"},
-        {"qualname": "sample_function"},
+        {"qualname": "sample_caller", "args": {}},
+        {"qualname": "sample_function", "args": {}},
     ]
 
 
@@ -50,7 +50,11 @@ def test_records_each_recursive_call_separately():
     sample_recursive(2)
     calls = tracer.stop()
 
-    assert calls == [{"qualname": "sample_recursive"}] * 3
+    assert calls == [
+        {"qualname": "sample_recursive", "args": {"n": 2}},
+        {"qualname": "sample_recursive", "args": {"n": 1}},
+        {"qualname": "sample_recursive", "args": {"n": 0}},
+    ]
 
 
 def test_does_not_record_class_body_execution():
@@ -67,12 +71,13 @@ def test_does_not_record_class_body_execution():
     SampleClass().method()
     calls = tracer.stop()
 
-    assert calls == [
-        {"qualname": "sample_function"},
-        {
-            "qualname": "test_does_not_record_class_body_execution.<locals>.SampleClass.method"
-        },
-    ]
+    # `self` isn't JSON-serializable, so it falls back to repr(), whose
+    # exact text (memory address) isn't worth pinning down here.
+    assert calls[0] == {"qualname": "sample_function", "args": {}}
+    assert calls[1]["qualname"] == (
+        "test_does_not_record_class_body_execution.<locals>.SampleClass.method"
+    )
+    assert isinstance(calls[1]["args"]["self"], str)
 
 
 def test_stop_restores_a_previously_active_tracer():
@@ -106,7 +111,7 @@ def test_records_calls_made_on_a_worker_thread():
     thread.join()
     calls = tracer.stop()
 
-    assert calls == [{"qualname": "sample_function"}]
+    assert calls == [{"qualname": "sample_function", "args": {}}]
 
 
 def test_stop_restores_the_previous_thread_tracer():
@@ -133,7 +138,7 @@ def test_does_not_record_comprehension_frames():
     sample_function_with_a_comprehension()
     calls = tracer.stop()
 
-    assert calls == [{"qualname": "sample_function_with_a_comprehension"}]
+    assert calls == [{"qualname": "sample_function_with_a_comprehension", "args": {}}]
 
 
 def test_start_does_not_blind_a_previously_active_tracer():
@@ -174,3 +179,75 @@ def test_start_does_not_blind_a_previously_active_thread_tracer():
         threading.settrace(None)
 
     assert "sample_function" in seen
+
+
+def sample_function_with_positional_and_default_args(a, b, c=3):
+    return a + b + c
+
+
+def test_records_positional_and_default_args():
+    tracer.start("tests")
+    sample_function_with_positional_and_default_args(1, 2)
+    calls = tracer.stop()
+
+    assert calls == [
+        {
+            "qualname": "sample_function_with_positional_and_default_args",
+            "args": {"a": 1, "b": 2, "c": 3},
+        }
+    ]
+
+
+def sample_function_with_varargs(*args, **kwargs):
+    return args, kwargs
+
+
+def test_records_varargs_and_kwargs_already_collected():
+    tracer.start("tests")
+    sample_function_with_varargs(1, 2, x=3)
+    calls = tracer.stop()
+
+    assert calls == [
+        {
+            "qualname": "sample_function_with_varargs",
+            "args": {"args": [1, 2], "kwargs": {"x": 3}},
+        }
+    ]
+
+
+def sample_function_with_a_mutable_arg(values):
+    values.append("mutated")
+    return values
+
+
+def test_records_the_arg_value_as_of_the_call_not_after_mutation():
+    tracer.start("tests")
+    sample_function_with_a_mutable_arg([1, 2])
+    calls = tracer.stop()
+
+    assert calls == [
+        {"qualname": "sample_function_with_a_mutable_arg", "args": {"values": [1, 2]}}
+    ]
+
+
+class _NotJSONSerializable:
+    pass
+
+
+def sample_function_with_a_non_serializable_arg(value):
+    return value
+
+
+def test_falls_back_to_repr_for_a_non_json_serializable_arg():
+    obj = _NotJSONSerializable()
+
+    tracer.start("tests")
+    sample_function_with_a_non_serializable_arg(obj)
+    calls = tracer.stop()
+
+    assert calls == [
+        {
+            "qualname": "sample_function_with_a_non_serializable_arg",
+            "args": {"value": repr(obj)},
+        }
+    ]

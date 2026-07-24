@@ -1,4 +1,5 @@
 import inspect
+import json
 import sys
 import threading
 from pathlib import Path
@@ -11,6 +12,16 @@ _start_thread = None
 _calls = []
 _previous_trace = None
 _previous_thread_trace = None
+
+
+def _snapshot(value):
+    # Round-tripping through JSON freezes the value as of this exact moment
+    # (later mutation by the traced code can't change what we recorded) and
+    # falls back to repr for anything that isn't JSON-serializable (e.g. self).
+    try:
+        return json.loads(json.dumps(value))
+    except TypeError:
+        return repr(value)
 
 
 def _trace_calls(frame, event, arg):
@@ -37,7 +48,11 @@ def _trace_calls(frame, event, arg):
         filename = _start_cwd / filename
     if not filename.resolve().is_relative_to(_target_dir):
         return
-    _calls.append({"qualname": co.co_qualname})
+    # At the "call" event, f_locals holds only the bound parameters (the
+    # function body hasn't run any assignments yet), already collected into
+    # a tuple/dict for *args/**kwargs.
+    args = {name: _snapshot(value) for name, value in frame.f_locals.items()}
+    _calls.append({"qualname": co.co_qualname, "args": args})
 
 
 def _dispatch(frame, event, arg):
