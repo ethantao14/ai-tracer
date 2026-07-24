@@ -16,6 +16,40 @@ def test_cli_prints_usage_and_exits_nonzero_with_no_arguments():
     assert "usage" in result.stderr.lower()
 
 
+def test_atexit_handlers_in_the_target_see_the_targets_own_argv(tmp_path):
+    # atexit handlers run after run() would otherwise already have
+    # restored ai-tracer's own state, unlike direct execution, where the
+    # process just exits with the target's state intact throughout.
+    marker = tmp_path / "atexit_marker.txt"
+    (tmp_path / "program.py").write_text(
+        "import atexit\n"
+        "import sys\n"
+        "\n"
+        "\n"
+        "def on_exit():\n"
+        f"    open({str(marker)!r}, 'w').write(repr(sys.argv))\n"
+        "\n"
+        "\n"
+        "atexit.register(on_exit)\n"
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ai_tracer.cli",
+            str(tmp_path / "program.py"),
+            "--flag",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert marker.read_text() == repr([str(tmp_path / "program.py"), "--flag"])
+
+
 def test_cli_runs_a_target_program(tmp_path):
     marker = tmp_path / "ran.txt"
     (tmp_path / "program.py").write_text(

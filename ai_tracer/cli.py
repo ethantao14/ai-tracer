@@ -13,7 +13,16 @@ def _local_module_names(target_dir):
     return names
 
 
-def run(target_path, program_args=()):
+def run(target_path, program_args=(), restore=True):
+    # restore=False for the CLI entry point below: an atexit handler the
+    # target registers runs after this function returns, but before the
+    # process actually exits, restoring state immediately would make that
+    # handler see ai-tracer's own argv/path/modules instead of the
+    # target's, unlike direct execution, where nothing is ever restored,
+    # the process just exits with the target's state intact. Library-style
+    # callers that keep running afterward (our own tests, future in-process
+    # use) need restore=True, the default, so nothing leaks to what runs
+    # next in the same process.
     resolved_path = Path(target_path).resolve()
     target_dir = str(resolved_path.parent)
 
@@ -45,12 +54,11 @@ def run(target_path, program_args=()):
     try:
         runpy.run_path(str(target_path), run_name="__main__")
     finally:
-        sys.argv = original_argv
-        # Restore the whole list, not just index 0, in case the target
-        # itself mutated sys.path (it runs in-process).
-        sys.path[:] = original_sys_path
-        sys.modules.clear()
-        sys.modules.update(original_sys_modules)
+        if restore:
+            sys.argv = original_argv
+            sys.path[:] = original_sys_path
+            sys.modules.clear()
+            sys.modules.update(original_sys_modules)
 
 
 def main():
@@ -62,7 +70,7 @@ def main():
         print("usage: ai-tracer <program> [program_args...]", file=sys.stderr)
         sys.exit(1)
     program, *program_args = argv
-    run(program, program_args)
+    run(program, program_args, restore=False)
 
 
 if __name__ == "__main__":
