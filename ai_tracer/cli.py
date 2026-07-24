@@ -3,6 +3,18 @@ import sys
 from pathlib import Path
 
 
+def _local_module_names(target_dir):
+    # Enumerated so run() can evict these specific names from sys.modules
+    # before the target runs, see the comment there for why.
+    names = set()
+    for entry in Path(target_dir).iterdir():
+        if entry.is_file() and entry.suffix == ".py":
+            names.add(entry.stem)
+        elif entry.is_dir() and (entry / "__init__.py").is_file():
+            names.add(entry.name)
+    return names
+
+
 def run(target_path, program_args=()):
     # target_path itself (not resolved_path below) is what gets passed to
     # runpy.run_path and into sys.argv, preserving whatever the caller
@@ -27,6 +39,19 @@ def run(target_path, program_args=()):
     # handle on its own.
     original_sys_path = list(sys.path)
     sys.path[0] = target_dir
+    # ai_tracer's own imports (this module's own "from pathlib import
+    # Path", etc.) already populate sys.modules before the target ever
+    # runs. A real `python target.py` process starts with none of that
+    # cached, so if the target directory defines its own file sharing a
+    # name with something already imported here, e.g. a local pathlib.py
+    # meant to shadow the stdlib module, direct execution would resolve
+    # the local file (nothing cached yet, target_dir is first on
+    # sys.path), but sys.modules is checked before sys.path is ever
+    # consulted, so this harness would otherwise silently hand back
+    # whatever was already imported instead. Evicting anything the target
+    # directory actually defines forces a fresh, correctly-shadowed import.
+    for name in _local_module_names(target_dir):
+        sys.modules.pop(name, None)
     # runpy.run_path only ever replaces argv[0] (see its _ModifiedArgv0),
     # everything else needs to be set up explicitly: this CLI's own argv
     # would otherwise leak into the target's sys.argv, and any arguments

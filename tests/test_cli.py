@@ -59,6 +59,39 @@ def test_cli_can_import_sibling_modules_in_the_target_directory(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_cli_lets_a_target_sibling_shadow_an_already_imported_module_name(tmp_path):
+    # ai_tracer.cli itself already does "from pathlib import Path" before
+    # the target ever runs, populating sys.modules. A real `python
+    # target.py` process starts with nothing cached, so a target directory
+    # defining its own pathlib.py would have that local file win (nothing
+    # imported yet, target_dir is first on sys.path). Through this harness,
+    # sys.modules would otherwise be checked first and silently hand back
+    # the already-imported stdlib module instead.
+    target_dir = tmp_path / "target_program"
+    target_dir.mkdir()
+    (target_dir / "pathlib.py").write_text("MARKER = 'local, not stdlib'\n")
+    (target_dir / "main.py").write_text(
+        "import pathlib\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    assert pathlib.MARKER == 'local, not stdlib'\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(target_dir / "main.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_cli_does_not_leak_its_own_argv_into_the_target(tmp_path):
     # runpy.run_path only ever replaces argv[0] (see runpy._ModifiedArgv0),
     # this CLI's own arguments would otherwise leak into the target's
