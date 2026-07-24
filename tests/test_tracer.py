@@ -251,3 +251,46 @@ def test_falls_back_to_repr_for_a_non_json_serializable_arg():
             "args": {"value": repr(obj)},
         }
     ]
+
+
+def sample_function_with_a_circular_arg(value):
+    return value
+
+
+def test_falls_back_to_repr_for_a_circular_container_arg():
+    circular = []
+    circular.append(circular)
+
+    tracer.start("tests")
+    sample_function_with_a_circular_arg(circular)
+    calls = tracer.stop()
+
+    assert calls == [
+        {
+            "qualname": "sample_function_with_a_circular_arg",
+            "args": {"value": repr(circular)},
+        }
+    ]
+
+
+def sample_outer_with_a_closure(secret):
+    unused_local = "not passed to inner"  # noqa: F841
+
+    def sample_inner(a):
+        return a + secret
+
+    return sample_inner(3)
+
+
+def test_does_not_record_closed_over_free_variables_as_args():
+    tracer.start("tests")
+    sample_outer_with_a_closure(2)
+    calls = tracer.stop()
+
+    assert calls == [
+        {"qualname": "sample_outer_with_a_closure", "args": {"secret": 2}},
+        {
+            "qualname": "sample_outer_with_a_closure.<locals>.sample_inner",
+            "args": {"a": 3},
+        },
+    ]

@@ -20,7 +20,10 @@ def _snapshot(value):
     # falls back to repr for anything that isn't JSON-serializable (e.g. self).
     try:
         return json.loads(json.dumps(value))
-    except TypeError:
+    except (TypeError, ValueError):
+        # TypeError for non-serializable values (e.g. self), ValueError for
+        # circular containers (json.dumps raises ValueError for those, not
+        # TypeError).
         return repr(value)
 
 
@@ -48,10 +51,16 @@ def _trace_calls(frame, event, arg):
         filename = _start_cwd / filename
     if not filename.resolve().is_relative_to(_target_dir):
         return
-    # At the "call" event, f_locals holds only the bound parameters (the
-    # function body hasn't run any assignments yet), already collected into
-    # a tuple/dict for *args/**kwargs.
-    args = {name: _snapshot(value) for name, value in frame.f_locals.items()}
+    # f_locals also holds closed-over free variables for a nested function,
+    # not just its own parameters, so pull names from getargvalues instead of
+    # every key.
+    arg_info = inspect.getargvalues(frame)
+    names = [*arg_info.args]
+    if arg_info.varargs:
+        names.append(arg_info.varargs)
+    if arg_info.keywords:
+        names.append(arg_info.keywords)
+    args = {name: _snapshot(frame.f_locals[name]) for name in names}
     _calls.append({"qualname": co.co_qualname, "args": args})
 
 
