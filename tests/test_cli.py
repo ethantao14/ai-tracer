@@ -60,13 +60,9 @@ def test_cli_can_import_sibling_modules_in_the_target_directory(tmp_path):
 
 
 def test_cli_lets_a_target_sibling_shadow_an_already_imported_module_name(tmp_path):
-    # ai_tracer.cli itself already does "from pathlib import Path" before
-    # the target ever runs, populating sys.modules. A real `python
-    # target.py` process starts with nothing cached, so a target directory
-    # defining its own pathlib.py would have that local file win (nothing
-    # imported yet, target_dir is first on sys.path). Through this harness,
-    # sys.modules would otherwise be checked first and silently hand back
-    # the already-imported stdlib module instead.
+    # ai_tracer.cli already imports pathlib before the target runs, unlike
+    # a fresh `python target.py` process. A local pathlib.py should still
+    # win, matching direct execution.
     target_dir = tmp_path / "target_program"
     target_dir.mkdir()
     (target_dir / "pathlib.py").write_text("MARKER = 'local, not stdlib'\n")
@@ -93,10 +89,6 @@ def test_cli_lets_a_target_sibling_shadow_an_already_imported_module_name(tmp_pa
 
 
 def test_cli_does_not_leak_its_own_argv_into_the_target(tmp_path):
-    # runpy.run_path only ever replaces argv[0] (see runpy._ModifiedArgv0),
-    # this CLI's own arguments would otherwise leak into the target's
-    # sys.argv, breaking any target that parses its own command-line
-    # arguments.
     (tmp_path / "argvy.py").write_text(
         "import sys\n"
         "\n"
@@ -120,9 +112,7 @@ def test_cli_does_not_leak_its_own_argv_into_the_target(tmp_path):
 
 
 def test_cli_preserves_the_original_program_string_in_argv_0(tmp_path):
-    # `python app.py` leaves sys.argv[0] as the literal string "app.py",
-    # not its resolved absolute path. A target that inspects or prints its
-    # own invocation path should see the same thing through this harness.
+    # `python app.py` leaves sys.argv[0] as "app.py", not its resolved path.
     (tmp_path / "argvy.py").write_text(
         "import sys\n"
         "\n"
@@ -147,10 +137,6 @@ def test_cli_preserves_the_original_program_string_in_argv_0(tmp_path):
 
 
 def test_run_restores_the_whole_sys_path_even_if_the_target_mutates_it(tmp_path):
-    # run() executes the target in-process. Only restoring sys.path[0]
-    # would leave the rest polluted if the target mutates sys.path more
-    # broadly than that (clears it, appends to it, reassigns it), or raise
-    # IndexError trying to restore an index into a list the target emptied.
     original_path = list(sys.path)
 
     target = tmp_path / "path_mutator.py"
@@ -161,11 +147,34 @@ def test_run_restores_the_whole_sys_path_even_if_the_target_mutates_it(tmp_path)
     assert sys.path == original_path
 
 
+def test_run_does_not_leak_imported_modules_into_a_later_run(tmp_path):
+    # run() can be called more than once in the same interpreter. A second,
+    # unrelated target shouldn't be able to pick up a module the first
+    # target imported, matching separate `python target.py` processes.
+    first_dir = tmp_path / "first"
+    first_dir.mkdir()
+    (first_dir / "helper.py").write_text("VALUE = 'from first run'\n")
+    (first_dir / "main.py").write_text("import helper\n")
+
+    cli.run(str(first_dir / "main.py"))
+
+    second_dir = tmp_path / "second"
+    second_dir.mkdir()
+    (second_dir / "main.py").write_text(
+        "try:\n"
+        "    import helper\n"
+        "    raise AssertionError('should not have found a helper module')\n"
+        "except ImportError:\n"
+        "    pass\n"
+    )
+
+    cli.run(str(second_dir / "main.py"))
+    assert "helper" not in sys.modules
+
+
 def test_cli_forwards_extra_arguments_to_the_target_program(tmp_path):
-    # `./run.sh app.py --config cfg.yml` should behave like
-    # `python app.py --config cfg.yml`, the target's own arguments have to
-    # actually reach it, not get rejected by ai-tracer's own argument
-    # parser or silently dropped.
+    # `run.sh app.py --config cfg.yml` should behave like
+    # `python app.py --config cfg.yml`.
     (tmp_path / "argvy.py").write_text(
         "import sys\n"
         "\n"
@@ -196,12 +205,7 @@ def test_cli_forwards_extra_arguments_to_the_target_program(tmp_path):
 
 
 def test_cli_forwards_a_literal_double_dash_to_the_target_program(tmp_path):
-    # argparse.REMAINDER would silently swallow a leading "--" right after
-    # the program path (its own convention for "stop parsing options"),
-    # forwarding ['--flag'] instead of ['--', '--flag']. A target that uses
-    # "--" itself, e.g. to separate its own flags from positional
-    # arguments, needs to see it preserved, same as `python app.py --
-    # --flag` would.
+    # Matches `python app.py -- --flag`, a literal "--" reaches the target.
     (tmp_path / "argvy.py").write_text(
         "import sys\n"
         "\n"
@@ -232,11 +236,8 @@ def test_cli_forwards_a_literal_double_dash_to_the_target_program(tmp_path):
 
 
 def test_cli_does_not_leak_the_launch_directory_into_target_imports(tmp_path):
-    # `python -m ai_tracer.cli` puts the invoking shell's cwd on sys.path,
-    # unlike a real `python target.py`, which only has the target's own
-    # directory there. A target importing a module that lives beside
-    # wherever ai-tracer happened to be launched from, but not beside the
-    # target itself, should fail exactly like direct execution would.
+    # A module beside the launch directory, not beside the target, should
+    # fail to import, matching direct execution.
     launch_dir = tmp_path / "launch_dir"
     launch_dir.mkdir()
     (launch_dir / "decoy.py").write_text(
