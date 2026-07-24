@@ -259,6 +259,9 @@ def sample_function_with_a_circular_arg(value):
 
 
 def test_falls_back_to_repr_for_a_circular_container_arg():
+    # A circular list's own __repr__ would recurse into every element too
+    # (list.__repr__ calls repr() on each item), so even for an exact-type
+    # list this is bypassed via object.__repr__, not repr(circular).
     circular = []
     circular.append(circular)
 
@@ -269,7 +272,7 @@ def test_falls_back_to_repr_for_a_circular_container_arg():
     assert calls == [
         {
             "qualname": "sample_function_with_a_circular_arg",
-            "args": {"value": repr(circular)},
+            "args": {"value": object.__repr__(circular)},
         }
     ]
 
@@ -285,8 +288,9 @@ def sample_function_with_an_arg_that_breaks_json_encoding(value):
 
 def test_falls_back_to_repr_for_a_list_subclass_with_a_raising_iter():
     # A list/dict subclass is never introspected directly (see
-    # _to_json_safe), so this falls back to repr() without ever calling the
-    # subclass's own __iter__.
+    # _to_json_safe), and its repr isn't trusted either (it could itself be
+    # overridden), so this uses object.__repr__ without ever calling the
+    # subclass's own __iter__ or __repr__.
     broken = _RaisesDuringIteration([1, 2])
 
     tracer.start("tests")
@@ -296,7 +300,7 @@ def test_falls_back_to_repr_for_a_list_subclass_with_a_raising_iter():
     assert calls == [
         {
             "qualname": "sample_function_with_an_arg_that_breaks_json_encoding",
-            "args": {"value": repr(broken)},
+            "args": {"value": object.__repr__(broken)},
         }
     ]
 
@@ -325,7 +329,7 @@ def test_snapshotting_a_side_effecting_container_subclass_does_not_mutate_it():
     assert calls == [
         {
             "qualname": "sample_function_with_a_side_effecting_arg",
-            "args": {"value": repr(tricky)},
+            "args": {"value": object.__repr__(tricky)},
         }
     ]
 
@@ -361,7 +365,7 @@ def sample_function_with_a_broken_repr_arg(value):
     return value
 
 
-def test_falls_back_to_a_placeholder_when_repr_itself_raises():
+def test_never_calls_a_raising_repr_on_a_target_defined_object():
     obj = _RaisesOnRepr()
 
     tracer.start("tests")
@@ -371,7 +375,41 @@ def test_falls_back_to_a_placeholder_when_repr_itself_raises():
     assert calls == [
         {
             "qualname": "sample_function_with_a_broken_repr_arg",
-            "args": {"value": "<unrepresentable _RaisesOnRepr>"},
+            "args": {"value": object.__repr__(obj)},
+        }
+    ]
+
+
+class _SideEffectingRepr:
+    def __init__(self, log):
+        self._log = log
+
+    def __repr__(self):
+        self._log.append("repr called")
+        return "SideEffectingRepr()"
+
+
+def sample_function_with_a_side_effecting_repr_arg(value):
+    return value
+
+
+def test_snapshotting_never_calls_a_side_effecting_repr():
+    # A target's own __repr__ is arbitrary code (mutation, I/O); calling it
+    # just to represent an argument would run that code before the traced
+    # function body even executes, changing when the target's own side
+    # effects happen.
+    log = []
+    obj = _SideEffectingRepr(log)
+
+    tracer.start("tests")
+    sample_function_with_a_side_effecting_repr_arg(obj)
+    calls = tracer.stop()
+
+    assert log == []
+    assert calls == [
+        {
+            "qualname": "sample_function_with_a_side_effecting_repr_arg",
+            "args": {"value": object.__repr__(obj)},
         }
     ]
 

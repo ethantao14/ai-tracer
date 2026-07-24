@@ -43,16 +43,19 @@ def _to_json_safe(value):
 
 def _snapshot(value):
     # Freezes the value as of this exact moment (later mutation by the
-    # traced code can't change what we recorded) and falls back to repr for
-    # anything that isn't a JSON-safe builtin (e.g. self, or a container
-    # subclass we deliberately don't introspect, see _to_json_safe).
+    # traced code can't change what we recorded).
     try:
         return _to_json_safe(value)
     except Exception:  # noqa: BLE001 - any snapshot failure must not abort the target
-        try:
+        if type(value) is float:
+            # A float has no nested content, so its own repr (e.g. for NaN
+            # or infinity) can't reach any target-defined code.
             return repr(value)
-        except Exception:  # noqa: BLE001 - a raising __repr__ must not abort the target
-            return f"<unrepresentable {type(value).__name__}>"
+        # Anything else (a container that failed deeper in, or a
+        # target-defined class) could have a __repr__ - its own or a nested
+        # element's - that runs arbitrary code with side effects. Bypass
+        # every override via the base implementation instead of repr(value).
+        return object.__repr__(value)
 
 
 def _trace_calls(frame, event, arg):
