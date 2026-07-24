@@ -134,3 +134,43 @@ def test_does_not_record_comprehension_frames():
     calls = tracer.stop()
 
     assert calls == [{"qualname": "sample_function_with_a_comprehension"}]
+
+
+def test_start_does_not_blind_a_previously_active_tracer():
+    seen = []
+
+    def other_tracer(frame, event, arg):
+        if event == "call":
+            seen.append(frame.f_code.co_name)
+        return other_tracer
+
+    sys.settrace(other_tracer)
+    try:
+        tracer.start("tests")
+        sample_function()
+        tracer.stop()
+    finally:
+        sys.settrace(None)
+
+    assert "sample_function" in seen
+
+
+def test_start_does_not_blind_a_previously_active_thread_tracer():
+    seen = []
+
+    def other_tracer(frame, event, arg):
+        if event == "call":
+            seen.append(frame.f_code.co_name)
+        return other_tracer
+
+    threading.settrace(other_tracer)
+    try:
+        tracer.start("tests")
+        thread = threading.Thread(target=sample_function)
+        thread.start()
+        thread.join()
+        tracer.stop()
+    finally:
+        threading.settrace(None)
+
+    assert "sample_function" in seen
