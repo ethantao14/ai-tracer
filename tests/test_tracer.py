@@ -704,9 +704,14 @@ def test_generator_resumes_are_recorded_as_separate_sibling_calls():
         yield 2
 
     def sample_driver():
-        gen = sample_generator()
-        next(gen)
-        next(gen)
+        # Fully exhausting the generator (not just retrieving every yielded
+        # value) avoids relying on garbage-collection timing: an abandoned,
+        # not-yet-exhausted generator gets an extra "call" event whenever
+        # Python happens to close() it during GC, which isn't deterministic
+        # across Python versions/builds - list() drains it via repeated
+        # next() until it raises StopIteration on its own, with no dangling
+        # suspended state left for GC to close later.
+        list(sample_generator())
 
     tracer.start("tests")
     sample_driver()
@@ -714,11 +719,14 @@ def test_generator_resumes_are_recorded_as_separate_sibling_calls():
 
     driver_call_id = calls[0]["call_id"]
     generator_calls = [c for c in calls if "sample_generator" in c["qualname"]]
-    assert len(generator_calls) == 2
-    # Both resumes are parented directly to the driver that resumed them,
-    # not to each other - each resume is its own call/return pair.
+    # 2 yields, plus one final resume that runs off the end and raises
+    # StopIteration.
+    assert len(generator_calls) == 3
+    # Every resume is parented directly to the driver that resumed it, not
+    # to each other - each resume is its own call/return pair.
     assert all(c["parent_call_id"] == driver_call_id for c in generator_calls)
-    assert generator_calls[0]["call_id"] != generator_calls[1]["call_id"]
+    call_ids = {c["call_id"] for c in generator_calls}
+    assert len(call_ids) == 3
 
 
 def test_start_does_not_blind_a_previously_active_tracer_across_return_events():
