@@ -41,14 +41,20 @@ def _contains_array(value):
 
 
 def _is_generated_file(path):
-    # A file is ours to delete only if its very first line is the marker we
-    # write. Reading just the first line keeps this cheap and avoids being
-    # fooled by the marker text appearing lower down in an unrelated file.
+    # A file is ours to delete or overwrite only if its very first line is the
+    # marker we write. Reading just the first line keeps this cheap and avoids
+    # being fooled by the marker text appearing lower down in an unrelated file.
     try:
         with path.open(encoding="utf-8") as fh:
             return fh.readline().rstrip("\n") == _GENERATED_MARKER
     except (OSError, UnicodeDecodeError):
         return False
+
+
+def _would_clobber(path):
+    # True if writing here would destroy a file we didn't generate. A
+    # non-existent path, or one carrying our own marker, is safe to write.
+    return path.exists() and not _is_generated_file(path)
 
 
 def _local_module_names(target_dir):
@@ -118,18 +124,19 @@ def generate(trace_log_path, target_dir, output_dir="generated_tests"):
         if _is_generated_file(existing):
             existing.unlink()
 
-    # Two distinct module names can flatten to the same file name (dots
-    # become underscores, so "pkg.sub" and "pkg_sub" both want
-    # test_pkg_sub.py). Assign names in sorted order (deterministic) and
-    # append a numeric suffix on any real collision, so one module's tests
-    # never silently overwrite another's.
+    # Assign file names in sorted order (deterministic) and append a numeric
+    # suffix to avoid two kinds of clash: two module names that flatten to the
+    # same file ("pkg.sub" and "pkg_sub" both want test_pkg_sub.py), and an
+    # existing file we mustn't clobber - a user's own unmarked test_helper.py
+    # sharing this directory. A file already carrying our marker is fair game
+    # to overwrite (it's a stale generated file for this same module).
     used_names = {}
     written_paths = []
     for module_name in sorted(calls_by_module):
         base = f"test_{module_name.replace('.', '_')}"
         file_name = f"{base}.py"
         suffix = 1
-        while file_name in used_names:
+        while file_name in used_names or _would_clobber(output_path / file_name):
             file_name = f"{base}_{suffix}.py"
             suffix += 1
         used_names[file_name] = module_name
@@ -269,14 +276,29 @@ def _get_signature(module_name, qualname, module_cache, signature_cache):
 
 def _render_test_module(module_name, module_calls, target_dir):
     imported_names = sorted({call["qualname"] for call in module_calls})
+    # A variable that can't collide with any function this file imports: a
+    # traced function named `result` would otherwise turn `result = result(...)`
+    # into an assignment to a local named `result`, so the call on the right
+    # raises UnboundLocalError instead of invoking the imported function.
+    result_var = "result"
+    while result_var in imported_names:
+        result_var = "_" + result_var
 
     lines = [
         _GENERATED_MARKER,
         "import sys",
         "",
         f"sys.path.insert(0, {target_dir!r})",
-        f"from {module_name} import {', '.join(imported_names)}",
     ]
+    # Evict the target module (and any parent package) before importing, so
+    # this test loads the target's own module even if a same-named one is
+    # already cached (a previous test, or a stdlib module the target shadows) -
+    # adding target_dir to sys.path isn't enough, since an existing
+    # sys.modules entry is returned before the path is ever searched.
+    parts = module_name.split(".")
+    for i in range(len(parts)):
+        lines.append(f"sys.modules.pop({'.'.join(parts[: i + 1])!r}, None)")
+    lines.append(f"from {module_name} import {', '.join(imported_names)}")
 
     call_counts = {}
     for call in module_calls:
@@ -287,8 +309,8 @@ def _render_test_module(module_name, module_calls, target_dir):
         args = ", ".join(f"{name}={value!r}" for name, value in call["args"].items())
         lines += ["", ""]
         lines.append(f"def test_{qualname}_{index}():")
-        lines.append(f"    result = {qualname}({args})")
-        lines.append(f"    assert result == {call['return_value']!r}")
+        lines.append(f"    {result_var} = {qualname}({args})")
+        lines.append(f"    assert {result_var} == {call['return_value']!r}")
 
     return "\n".join(lines) + "\n"
 

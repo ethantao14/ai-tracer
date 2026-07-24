@@ -660,6 +660,97 @@ def test_sys_path_is_restored_after_a_target_mutates_it_at_import(tmp_path):
     assert sys.path == before
 
 
+def test_generates_a_passing_test_for_a_function_named_result(tmp_path):
+    # `result` is the name the generated body binds the call's result to, so a
+    # traced function actually named `result` must not turn into
+    # `result = result(...)` (which would raise UnboundLocalError).
+    (tmp_path / "helper.py").write_text("def result(x):\n    return x + 1\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import result\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    result(5)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    assert written == [output_dir / "test_helper.py"]
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_does_not_overwrite_a_user_file_sharing_the_generated_name(tmp_path):
+    # An unmarked test_helper.py already in the output dir (the user's own,
+    # for the same module) must be left intact; the generated tests go to a
+    # non-conflicting name instead.
+    (tmp_path / "helper.py").write_text("def f():\n    return 1\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import f\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    f()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "tests_dir"
+    output_dir.mkdir()
+    user_file = output_dir / "test_helper.py"
+    user_body = "def test_user_written():\n    assert True\n"
+    user_file.write_text(user_body)
+
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    assert user_file.read_text() == user_body
+    assert written == [output_dir / "test_helper_1.py"]
+    assert (output_dir / "test_helper_1.py").exists()
+
+
+def test_generated_test_evicts_the_cached_module_before_importing(tmp_path):
+    # The generated test pops the target module from sys.modules before
+    # importing, so it loads the target's own module even if a same-named one
+    # is already cached (a prior test, or a stdlib module the target shadows).
+    (tmp_path / "helper.py").write_text("def f():\n    return 1\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import f\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    f()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    source = (output_dir / "test_helper.py").read_text()
+    assert "sys.modules.pop('helper', None)" in source
+    assert source.index("sys.modules.pop('helper', None)") < source.index(
+        "from helper import f"
+    )
+
+
 def test_skips_a_call_whose_module_name_is_a_non_string(tmp_path, capsys):
     # A target that rebinds __name__ to a JSON-safe non-string is recorded
     # verbatim; generation must report it as invalid, not crash on .split().
