@@ -5,8 +5,8 @@ import sys
 from ai_tracer import cli
 
 
-def _without_tree_fields(record):
-    return {k: v for k, v in record.items() if k not in ("call_id", "parent_call_id")}
+def _only_qualname_and_args(record):
+    return {"qualname": record["qualname"], "args": record["args"]}
 
 
 def test_cli_prints_usage_and_exits_nonzero_with_no_arguments():
@@ -397,7 +397,7 @@ def test_cli_writes_a_trace_of_the_functions_the_target_calls(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     trace = json.loads((tmp_path / "program.trace.json").read_text())
-    assert [_without_tree_fields(c) for c in trace] == [
+    assert [_only_qualname_and_args(c) for c in trace] == [
         {"qualname": "main", "args": {}},
         {"qualname": "helper", "args": {}},
     ]
@@ -422,7 +422,7 @@ def test_cli_writes_a_trace_even_if_the_target_crashes(tmp_path):
 
     assert result.returncode != 0
     trace = json.loads((tmp_path / "crashy.trace.json").read_text())
-    assert [_without_tree_fields(c) for c in trace] == [
+    assert [_only_qualname_and_args(c) for c in trace] == [
         {"qualname": "doomed", "args": {}}
     ]
 
@@ -449,7 +449,7 @@ def test_cli_trace_does_not_include_stdlib_calls(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     trace = json.loads((tmp_path / "program.trace.json").read_text())
-    assert [_without_tree_fields(c) for c in trace] == [
+    assert [_only_qualname_and_args(c) for c in trace] == [
         {"qualname": "main", "args": {}}
     ]
 
@@ -489,7 +489,7 @@ def test_cli_trace_survives_the_target_changing_its_own_working_directory(tmp_pa
 
     assert result.returncode == 0, result.stdout + result.stderr
     trace = json.loads((target_dir / "program.trace.json").read_text())
-    assert [_without_tree_fields(c) for c in trace] == [
+    assert [_only_qualname_and_args(c) for c in trace] == [
         {"qualname": "main", "args": {}},
         {"qualname": "after_chdir", "args": {}},
     ]
@@ -518,7 +518,7 @@ def test_cli_trace_includes_the_arguments_a_function_was_called_with(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     trace = json.loads((tmp_path / "program.trace.json").read_text())
-    assert [_without_tree_fields(c) for c in trace] == [
+    assert [_only_qualname_and_args(c) for c in trace] == [
         {"qualname": "main", "args": {}},
         {"qualname": "add", "args": {"a": 1, "b": 2}},
     ]
@@ -549,7 +549,7 @@ def test_cli_trace_stays_valid_json_for_a_nan_argument(tmp_path):
     raw = (tmp_path / "program.trace.json").read_text()
     assert "NaN" not in raw
     trace = json.loads(raw)
-    assert [_without_tree_fields(c) for c in trace] == [
+    assert [_only_qualname_and_args(c) for c in trace] == [
         {"qualname": "main", "args": {}},
         {"qualname": "take", "args": {"value": "nan"}},
     ]
@@ -578,9 +578,105 @@ def test_cli_writes_a_trace_for_an_int_too_large_to_stringify(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     trace = json.loads((tmp_path / "program.trace.json").read_text())
-    assert _without_tree_fields(trace[0]) == {"qualname": "main", "args": {}}
+    assert _only_qualname_and_args(trace[0]) == {"qualname": "main", "args": {}}
     assert trace[1]["qualname"] == "take"
     assert isinstance(trace[1]["args"]["value"], str)
+
+
+def test_cli_trace_records_main_for_the_entry_script(tmp_path):
+    # Matches direct execution: `python program.py` gives the entry
+    # script's own functions __module__ == "__main__", not its filename.
+    (tmp_path / "program.py").write_text(
+        "def main():\n    return 1\n\n\nif __name__ == '__main__':\n    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(tmp_path / "program.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    trace = json.loads((tmp_path / "program.trace.json").read_text())
+    assert trace == [
+        {
+            "call_id": 0,
+            "parent_call_id": None,
+            "module": "__main__",
+            "qualname": "main",
+            "args": {},
+        }
+    ]
+
+
+def test_cli_trace_records_the_module_a_function_was_defined_in(tmp_path):
+    target_dir = tmp_path / "target_program"
+    target_dir.mkdir()
+    (target_dir / "helper.py").write_text("def double(x):\n    return x * 2\n")
+    (target_dir / "main.py").write_text(
+        "from helper import double\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    double(21)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(target_dir / "main.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    trace = json.loads((target_dir / "main.trace.json").read_text())
+    assert trace[0]["module"] == "__main__"
+    assert trace[0]["qualname"] == "main"
+    assert trace[1]["module"] == "helper"
+    assert trace[1]["qualname"] == "double"
+
+
+def test_cli_trace_resolves_a_package_init_module_correctly(tmp_path):
+    # A function defined directly in pkg/__init__.py has __module__ == "pkg",
+    # not "pkg.__init__" - matching how Python's own import machinery names
+    # it, not a naive filename-to-dotted-path conversion.
+    target_dir = tmp_path / "target_program"
+    target_dir.mkdir()
+    pkg_dir = target_dir / "pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("def from_init():\n    return 1\n")
+    (pkg_dir / "sub.py").write_text("def from_sub():\n    return 1\n")
+    (target_dir / "main.py").write_text(
+        "from pkg import from_init\n"
+        "from pkg.sub import from_sub\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    from_init()\n"
+        "    from_sub()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(target_dir / "main.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    trace = json.loads((target_dir / "main.trace.json").read_text())
+    modules_by_qualname = {c["qualname"]: c["module"] for c in trace}
+    assert modules_by_qualname["from_init"] == "pkg"
+    assert modules_by_qualname["from_sub"] == "pkg.sub"
 
 
 def test_cli_trace_includes_the_call_tree(tmp_path):

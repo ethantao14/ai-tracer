@@ -136,10 +136,21 @@ def _trace_calls(frame):
     call_id = next(_call_id_counter)
     parent_call_id = stack[-1] if stack else None
     stack.append(call_id)
+    # f_globals is the actual namespace the function was defined in, so
+    # __name__ here is exactly what Python's own import machinery already
+    # assigned it: "__main__" for the entry script (matching direct
+    # execution), the real dotted name for an imported module, and
+    # correctly "pkg" rather than "pkg.__init__" for a package's __init__.py
+    # - no need to reconstruct any of that from the file path ourselves.
+    # Snapshotted like any other target-controlled value: a target that
+    # rebinds its own __name__ to something non-JSON-safe must not be able
+    # to break the eventual json.dumps() of the whole trace.
+    module = _snapshot(frame.f_globals.get("__name__"))
     _calls.append(
         {
             "call_id": call_id,
             "parent_call_id": parent_call_id,
+            "module": module,
             "qualname": co.co_qualname,
             "args": args,
         }
