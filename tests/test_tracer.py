@@ -5,12 +5,11 @@ import threading
 from ai_tracer import tracer
 
 
-def _without_tree_fields(record):
-    # Most of these tests are about qualname/args, not the call tree
-    # (call_id/parent_call_id) - PR4 added those fields, but re-pinning
-    # every one of these tests to exact call_id integers would couple
-    # unrelated concerns together.
-    return {k: v for k, v in record.items() if k not in ("call_id", "parent_call_id")}
+def _only_qualname_and_args(record):
+    # Most of these tests are about qualname/args specifically, not the
+    # call tree (call_id/parent_call_id) or module resolution - an allowlist
+    # keeps them decoupled from those concerns as more fields get added.
+    return {"qualname": record["qualname"], "args": record["args"]}
 
 
 def sample_function():
@@ -22,7 +21,7 @@ def test_start_stop_records_a_simple_call():
     sample_function()
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {"qualname": "sample_function", "args": {}}
     ]
 
@@ -44,7 +43,7 @@ def test_records_nested_calls_in_call_order():
     sample_caller()
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {"qualname": "sample_caller", "args": {}},
         {"qualname": "sample_function", "args": {}},
     ]
@@ -61,7 +60,7 @@ def test_records_each_recursive_call_separately():
     sample_recursive(2)
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {"qualname": "sample_recursive", "args": {"n": 2}},
         {"qualname": "sample_recursive", "args": {"n": 1}},
         {"qualname": "sample_recursive", "args": {"n": 0}},
@@ -84,7 +83,10 @@ def test_does_not_record_class_body_execution():
 
     # `self` isn't JSON-serializable, so it falls back to repr(), whose
     # exact text (memory address) isn't worth pinning down here.
-    assert _without_tree_fields(calls[0]) == {"qualname": "sample_function", "args": {}}
+    assert _only_qualname_and_args(calls[0]) == {
+        "qualname": "sample_function",
+        "args": {},
+    }
     assert calls[1]["qualname"] == (
         "test_does_not_record_class_body_execution.<locals>.SampleClass.method"
     )
@@ -122,7 +124,7 @@ def test_records_calls_made_on_a_worker_thread():
     thread.join()
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {"qualname": "sample_function", "args": {}}
     ]
 
@@ -151,7 +153,7 @@ def test_does_not_record_comprehension_frames():
     sample_function_with_a_comprehension()
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {"qualname": "sample_function_with_a_comprehension", "args": {}}
     ]
 
@@ -205,7 +207,7 @@ def test_records_positional_and_default_args():
     sample_function_with_positional_and_default_args(1, 2)
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_function_with_positional_and_default_args",
             "args": {"a": 1, "b": 2, "c": 3},
@@ -222,7 +224,7 @@ def test_records_varargs_and_kwargs_already_collected():
     sample_function_with_varargs(1, 2, x=3)
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_function_with_varargs",
             "args": {"args": [1, 2], "kwargs": {"x": 3}},
@@ -240,7 +242,7 @@ def test_records_the_arg_value_as_of_the_call_not_after_mutation():
     sample_function_with_a_mutable_arg([1, 2])
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {"qualname": "sample_function_with_a_mutable_arg", "args": {"values": [1, 2]}}
     ]
 
@@ -260,7 +262,7 @@ def test_falls_back_to_repr_for_a_non_json_serializable_arg():
     sample_function_with_a_non_serializable_arg(obj)
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_function_with_a_non_serializable_arg",
             "args": {"value": repr(obj)},
@@ -283,7 +285,7 @@ def test_falls_back_to_repr_for_a_circular_container_arg():
     sample_function_with_a_circular_arg(circular)
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_function_with_a_circular_arg",
             "args": {"value": object.__repr__(circular)},
@@ -311,7 +313,7 @@ def test_falls_back_to_repr_for_a_list_subclass_with_a_raising_iter():
     sample_function_with_an_arg_that_breaks_json_encoding(broken)
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_function_with_an_arg_that_breaks_json_encoding",
             "args": {"value": object.__repr__(broken)},
@@ -340,7 +342,7 @@ def test_snapshotting_a_side_effecting_container_subclass_does_not_mutate_it():
     calls = tracer.stop()
 
     assert tricky == [1, 2, 3]
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_function_with_a_side_effecting_arg",
             "args": {"value": object.__repr__(tricky)},
@@ -358,7 +360,7 @@ def test_falls_back_to_repr_for_nan_and_infinity():
     sample_function_with_a_non_finite_float_arg(math.inf)
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_function_with_a_non_finite_float_arg",
             "args": {"value": "nan"},
@@ -385,7 +387,7 @@ def test_falls_back_to_a_safe_placeholder_for_an_int_too_large_to_stringify():
     sample_function_with_a_huge_int_arg(huge)
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_function_with_a_huge_int_arg",
             "args": {"value": object.__repr__(huge)},
@@ -423,7 +425,7 @@ def test_snapshotting_never_calls_a_custom_metaclass_eq():
     calls = tracer.stop()
 
     assert log == []
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_function_with_a_custom_metaclass_arg",
             "args": {"value": object.__repr__(obj)},
@@ -447,7 +449,7 @@ def test_never_calls_a_raising_repr_on_a_target_defined_object():
     sample_function_with_a_broken_repr_arg(obj)
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_function_with_a_broken_repr_arg",
             "args": {"value": object.__repr__(obj)},
@@ -481,7 +483,7 @@ def test_snapshotting_never_calls_a_side_effecting_repr():
     calls = tracer.stop()
 
     assert log == []
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_function_with_a_side_effecting_repr_arg",
             "args": {"value": object.__repr__(obj)},
@@ -518,7 +520,7 @@ def test_rejecting_a_non_string_dict_key_never_calls_its_repr():
     calls = tracer.stop()
 
     assert log == []
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_function_with_a_non_string_dict_key_arg",
             "args": {"value": object.__repr__(arg)},
@@ -545,7 +547,7 @@ def test_tolerates_a_generator_deleting_its_own_argument_before_a_resume():
     next(gen)
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {
             "qualname": "sample_generator_that_deletes_its_own_argument",
             "args": {"x": 5},
@@ -572,7 +574,7 @@ def test_does_not_record_closed_over_free_variables_as_args():
     sample_outer_with_a_closure(2)
     calls = tracer.stop()
 
-    assert [_without_tree_fields(c) for c in calls] == [
+    assert [_only_qualname_and_args(c) for c in calls] == [
         {"qualname": "sample_outer_with_a_closure", "args": {"secret": 2}},
         {
             "qualname": "sample_outer_with_a_closure.<locals>.sample_inner",
@@ -590,6 +592,7 @@ def test_a_top_level_call_has_no_parent():
         {
             "call_id": 0,
             "parent_call_id": None,
+            "module": "test_tracer",
             "qualname": "sample_function",
             "args": {},
         }
