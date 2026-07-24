@@ -755,7 +755,7 @@ def test_conftest_evicts_cached_target_modules_once_for_the_session(tmp_path):
     assert "'helper'" in conftest and "'config'" in conftest
     # Eviction is by top-level name, so a cached pkg.sub is cleared too, not
     # only the bare package root.
-    assert "_top in _local" in conftest
+    assert "_name.split('.')[0] in _local" in conftest
     # Test files no longer do their own eviction; they just import.
     assert "_local" not in (output_dir / "test_helper.py").read_text()
 
@@ -866,7 +866,49 @@ def test_output_dir_that_is_a_package_under_target_does_not_self_evict(tmp_path)
     (output_dir / "__init__.py").write_text("")
     generator.generate(str(trace_path), str(tmp_path), str(output_dir))
 
-    assert "_top != _own" in (output_dir / "conftest.py").read_text()
+    assert "_name not in _keep" in (output_dir / "conftest.py").read_text()
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_output_dir_nested_in_a_target_package_still_evicts_siblings(tmp_path):
+    # Output dir is a subpackage inside a target package (<target>/pkg/tests).
+    # The conftest's own ancestor chain (pkg, pkg.tests, pkg.tests.conftest)
+    # must be spared, but a sibling target submodule (pkg.calc) must still be
+    # evicted rather than skipped along with the whole pkg tree.
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    trace_path = _trace(
+        tmp_path,
+        "from pkg.calc import add\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    add(2, 3)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = pkg / "tests"
+    output_dir.mkdir()
+    (output_dir / "__init__.py").write_text("")
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    conftest = (output_dir / "conftest.py").read_text()
+    # Only the ancestor chain is spared; the eviction is keyed off _keep.
+    assert "_keep = {__name__}" in conftest
+    assert "'pkg'" in conftest
 
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", str(output_dir)],
