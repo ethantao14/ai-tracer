@@ -75,6 +75,8 @@ def test_double_0():
     assert result == 42
 ```
 
+It also writes a `conftest.py` next to them. That file runs once when pytest starts and clears any target module cached under the same name (a target module shadowing another, or a stale entry from a previous run) so every generated test imports the target's own code. Doing this once, rather than in each test file, keeps a module or package that other target modules import at load time from being re-executed per file. If a `conftest.py` ai-tracer didn't generate already exists in the output directory, it's left untouched (each test file still sets up `sys.path` itself, so imports resolve regardless). Run the generated tests as their own pytest invocation, e.g. `pytest generated_tests/`.
+
 Not every recorded call becomes a test. A call is skipped, with a one-line reason printed to stderr (so it's never a silent no-op), when it can't be reconstructed safely as a standalone test:
 
 - It isn't a plain top-level function (a method, nested function, or lambda). Only module-level functions are importable by name.

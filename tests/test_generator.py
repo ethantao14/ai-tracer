@@ -723,11 +723,10 @@ def test_does_not_overwrite_a_user_file_sharing_the_generated_name(tmp_path):
     assert (output_dir / "test_helper_1.py").exists()
 
 
-def test_generated_test_evicts_cached_target_modules_before_importing(tmp_path):
-    # The generated test evicts the target's own modules from sys.modules
-    # before importing - not only the module under test, but every target
-    # sibling too - so it loads the target's own versions even if same-named
-    # modules are already cached, then imports.
+def test_conftest_evicts_cached_target_modules_once_for_the_session(tmp_path):
+    # A single generated conftest.py, not each test file, evicts the target's
+    # own modules (and packages) from sys.modules and sets up sys.path. Doing
+    # it once is what keeps a shared target module imported exactly once.
     (tmp_path / "config.py").write_text("VALUE = 1\n")
     (tmp_path / "helper.py").write_text(
         "from config import VALUE\n\n\ndef f():\n    return VALUE\n"
@@ -748,11 +747,81 @@ def test_generated_test_evicts_cached_target_modules_before_importing(tmp_path):
     output_dir = tmp_path / "generated_tests"
     generator.generate(str(trace_path), str(tmp_path), str(output_dir))
 
+    conftest = (output_dir / "conftest.py").read_text()
+    assert f"sys.path.insert(0, {str(tmp_path.resolve())!r})" in conftest
+    # Both the module under test and its sibling are evicted in the conftest.
+    assert "'helper'" in conftest and "'config'" in conftest
+    # The per-file eviction loop is gone; test files just import.
+    assert "for _cached in " not in (output_dir / "test_helper.py").read_text()
+
+
+def test_does_not_overwrite_a_users_existing_conftest(tmp_path, capsys):
+    (tmp_path / "helper.py").write_text("def f():\n    return 1\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import f\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    f()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "tests_dir"
+    output_dir.mkdir()
+    user_conftest = output_dir / "conftest.py"
+    user_body = "# my own conftest\n"
+    user_conftest.write_text(user_body)
+
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    assert user_conftest.read_text() == user_body
+    assert "conftest.py" in capsys.readouterr().err
+    # The generated test still resolves imports via its own sys.path insert.
     source = (output_dir / "test_helper.py").read_text()
-    eviction = "for _cached in "
-    # Both the module under test and its sibling are evicted, before the import.
-    assert "'helper'" in source and "'config'" in source
-    assert source.index(eviction) < source.index("from helper import f")
+    assert f"sys.path.insert(0, {str(tmp_path.resolve())!r})" in source
+
+
+def test_two_plain_modules_sharing_import_state_generate_passing_tests(tmp_path):
+    # b.py imports a token that a.py sets up at import time. pytest runs both
+    # generated files in one process; a.py must be imported exactly once (not
+    # re-evicted per file), or the value b sees would differ from the trace.
+    (tmp_path / "a.py").write_text(
+        "import itertools\n\nCOUNTER = itertools.count()\nTOKEN = next(COUNTER)\n"
+        "\n\ndef fa():\n    return TOKEN\n"
+    )
+    (tmp_path / "b.py").write_text(
+        "from a import TOKEN\n\n\ndef fb():\n    return TOKEN\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from a import fa\n"
+        "from b import fb\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    fa()\n"
+        "    fb()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout
 
 
 def test_generated_tests_for_two_submodules_share_one_package_init(tmp_path):

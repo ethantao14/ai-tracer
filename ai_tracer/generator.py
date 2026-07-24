@@ -133,6 +133,26 @@ def generate(trace_log_path, target_dir, output_dir="generated_tests"):
         if _is_generated_file(existing):
             existing.unlink()
 
+    # A single conftest.py does the import setup once for the whole generated
+    # test session: it puts target_dir on sys.path and evicts any target-local
+    # name cached under the same identity. Doing this once (not in every test
+    # file) is what keeps it correct: a shared module or package is imported
+    # exactly once, so its import-time state stays consistent across files,
+    # while a stale or shadowing same-named module is still cleared first. Only
+    # written if it wouldn't clobber a conftest.py the user already keeps here;
+    # each test file also inserts target_dir itself, so imports still resolve
+    # even when this conftest is skipped.
+    conftest_path = output_path / "conftest.py"
+    if _would_clobber(conftest_path):
+        print(
+            f"Not writing {conftest_path}: a conftest.py that ai-tracer didn't "
+            "generate is already there; generated tests fall back to their own "
+            "sys.path setup",
+            file=sys.stderr,
+        )
+    else:
+        conftest_path.write_text(_render_conftest(target_dir))
+
     # Assign file names in sorted order (deterministic) and append a numeric
     # suffix to avoid two kinds of clash: two module names that flatten to the
     # same file ("pkg.sub" and "pkg_sub" both want test_pkg_sub.py), and an
@@ -289,6 +309,29 @@ def _get_signature(module_name, qualname, module_cache, signature_cache):
     return signature_cache[key]
 
 
+def _render_conftest(target_dir):
+    # Runs once, before pytest collects any generated test file. Puts the
+    # target dir on sys.path and evicts every target-local name (modules and
+    # packages alike) that's cached under the same identity, so each test then
+    # imports the target's own module rather than a stale or shadowing
+    # same-named one. Doing the eviction exactly once here - rather than in
+    # every test file - is what makes it safe to evict packages too: the
+    # target's modules are each imported a single time for the whole session,
+    # so import-time state a module or package sets up stays consistent across
+    # every test that depends on it.
+    local = sorted(_local_module_names(target_dir))
+    lines = [
+        _GENERATED_MARKER,
+        "import sys",
+        "",
+        f"sys.path.insert(0, {target_dir!r})",
+        "",
+        f"for _cached in {tuple(local)!r}:",
+        "    sys.modules.pop(_cached, None)",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _render_test_module(module_name, module_calls, target_dir):
     imported_names = sorted({call["qualname"] for call in module_calls})
     # A variable that can't collide with any function this file imports: a
@@ -299,30 +342,17 @@ def _render_test_module(module_name, module_calls, target_dir):
     while result_var in imported_names:
         result_var = "_" + result_var
 
+    # The conftest.py generated alongside this file evicts stale/shadowing
+    # target modules once for the whole session; this per-file sys.path.insert
+    # is a fallback so imports still resolve if that conftest was skipped (the
+    # user already had one) or the file is run on its own.
     lines = [
         _GENERATED_MARKER,
         "import sys",
         "",
         f"sys.path.insert(0, {target_dir!r})",
+        f"from {module_name} import {', '.join(imported_names)}",
     ]
-    # Evict target-local modules before importing, so this test loads the
-    # target's own modules even when a same-named one is already cached - not
-    # just the module under test, but any plain sibling it imports (a target
-    # config.py shadowing a cached config) and any stdlib name the target
-    # shadows. Adding target_dir to sys.path isn't enough on its own: an
-    # existing sys.modules entry is returned before the path is ever searched.
-    # Package names are deliberately never evicted here: pytest imports all
-    # generated files in one process, so re-evicting a shared package would
-    # re-run its __init__.py per file, which submodules of that package could
-    # observe as changed state. A package is imported once by whichever test
-    # file needs it first and reused thereafter, exactly like a normal run.
-    modules, packages = _local_top_level(target_dir)
-    evict = set(modules)
-    if module_name not in packages:
-        evict.add(module_name)
-    lines.append(f"for _cached in {tuple(sorted(evict))!r}:")
-    lines.append("    sys.modules.pop(_cached, None)")
-    lines.append(f"from {module_name} import {', '.join(imported_names)}")
 
     call_counts = {}
     for call in module_calls:
