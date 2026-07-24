@@ -57,23 +57,31 @@ def _would_clobber(path):
     return path.exists() and not _is_generated_file(path)
 
 
-def _local_top_level(target_dir):
-    # Split the target dir's top-level importable names into plain modules
-    # (single .py files) and packages (directories with __init__.py). The
-    # distinction matters for eviction: re-importing a plain module is
-    # harmless, but re-importing a package re-runs its __init__.py.
-    modules, packages = set(), set()
-    for entry in Path(target_dir).iterdir():
-        if entry.is_file() and entry.suffix == ".py":
-            modules.add(entry.stem)
-        elif entry.is_dir() and (entry / "__init__.py").is_file():
-            packages.add(entry.name)
-    return modules, packages
+def _is_importable_package_dir(path):
+    # A regular package (has __init__.py) or a namespace package (no
+    # __init__.py, but a directory that still contributes importable modules).
+    # Checking for any direct .py file catches the common namespace-package
+    # layout without trying to resolve arbitrarily nested namespace-only trees.
+    if (path / "__init__.py").is_file():
+        return True
+    return any(child.suffix == ".py" for child in path.iterdir())
 
 
 def _local_module_names(target_dir):
-    modules, packages = _local_top_level(target_dir)
-    return modules | packages
+    # Every top-level name the target dir makes importable: each .py file's
+    # stem, and each subdirectory that's a package (regular or namespace).
+    # "conftest" is excluded: it's pytest's own infrastructure, never imported
+    # as a target module by name, and evicting it would delete the conftest
+    # pytest is actively importing (the generated conftest itself, or an
+    # ancestor one), aborting collection with a KeyError.
+    names = set()
+    for entry in Path(target_dir).iterdir():
+        if entry.is_file() and entry.suffix == ".py":
+            names.add(entry.stem)
+        elif entry.is_dir() and _is_importable_package_dir(entry):
+            names.add(entry.name)
+    names.discard("conftest")
+    return names
 
 
 def generate(trace_log_path, target_dir, output_dir="generated_tests"):

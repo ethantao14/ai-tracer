@@ -758,6 +758,77 @@ def test_conftest_evicts_cached_target_modules_once_for_the_session(tmp_path):
     assert "_local" not in (output_dir / "test_helper.py").read_text()
 
 
+def test_a_target_conftest_is_not_in_the_eviction_set(tmp_path):
+    # If the target dir has its own conftest.py, "conftest" must not end up in
+    # the generated conftest's eviction set - deleting sys.modules['conftest']
+    # while pytest is importing a conftest aborts collection with a KeyError.
+    (tmp_path / "conftest.py").write_text("# target's own conftest\n")
+    (tmp_path / "helper.py").write_text("def f():\n    return 1\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import f\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    f()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    # output dir beneath the target dir, so pytest picks up the target's
+    # conftest.py as an ancestor when running the generated tests.
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    assert "'conftest'" not in (output_dir / "conftest.py").read_text()
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_generates_a_passing_test_for_a_namespace_package(tmp_path):
+    # A namespace package (directory with modules but no __init__.py) is still
+    # importable, so its name must be in the eviction set and its submodule
+    # calls must generate passing tests.
+    pkg = tmp_path / "nspkg"
+    pkg.mkdir()
+    (pkg / "sub.py").write_text("def f(x):\n    return x + 1\n")
+    trace_path = _trace(
+        tmp_path,
+        "from nspkg.sub import f\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    f(4)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    assert [p.name for p in written] == ["test_nspkg_sub.py"]
+    assert "'nspkg'" in (output_dir / "conftest.py").read_text()
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
 def test_does_not_overwrite_a_users_existing_conftest(tmp_path, capsys):
     (tmp_path / "helper.py").write_text("def f():\n    return 1\n")
     trace_path = _trace(
