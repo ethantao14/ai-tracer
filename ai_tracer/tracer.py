@@ -146,31 +146,54 @@ def _trace_calls(frame):
     # rebinds its own __name__ to something non-JSON-safe must not be able
     # to break the eventual json.dumps() of the whole trace.
     module = _snapshot(frame.f_globals.get("__name__"))
-    _calls.append(
-        {
-            "call_id": call_id,
-            "parent_call_id": parent_call_id,
-            "module": module,
-            "qualname": co.co_qualname,
-            "args": args,
-        }
-    )
-    return call_id
+    record = {
+        "call_id": call_id,
+        "parent_call_id": parent_call_id,
+        "module": module,
+        "qualname": co.co_qualname,
+        "args": args,
+    }
+    _calls.append(record)
+    return record
 
 
-def _make_local_tracer(call_id, previous_local):
+def _make_local_tracer(record, previous_local):
     # Unlike PR2's chaining (which fully handed the frame's local tracer off
     # to whatever tool was already active, since _trace_calls only needed
     # "call"), we now need our own "return" event too, to pop the call
     # stack. So this stays the local tracer for the frame's whole lifetime,
     # forwarding every event to the previously-active tracer's own
     # continuation on top of our own return-driven bookkeeping.
-    state = {"previous_local": previous_local}
+    # `record` (this call's own dict, held by direct reference) is mutated
+    # in place on "return" rather than looked up via `_calls[call_id]`: two
+    # threads can both obtain a call_id before either appends its record, so
+    # call_id is not reliably that record's index into the shared _calls
+    # list once multiple threads are calling into traced code concurrently.
+    state = {"previous_local": previous_local, "saw_exception": False}
 
     def handler(frame, event, arg):
-        if event == "return" and call_id is not None:
+        if record is not None and event == "exception":
+            state["saw_exception"] = True
+        elif record is not None and event == "return":
+            # "return" fires for every frame exit, exceptional or not, with
+            # arg set to the actual return value only for a genuine return -
+            # arg is None both for an explicit/implicit `return None` *and*
+            # for an exception unwinding through this frame, and those two
+            # cases are indistinguishable from "return" alone. A non-None
+            # arg is unambiguous (even a frame that caught its own exception
+            # and returned a value lands here), so only fall back to the
+            # exception flag when arg is None. That still misreads "caught
+            # it, then returned None" (explicitly or implicitly) as raised -
+            # accepted, since the alternative is silently losing a real propagating
+            # exception, which is worse.
+            if arg is not None:
+                record["raised"] = False
+                record["return_value"] = _snapshot(arg)
+            else:
+                record["raised"] = state["saw_exception"]
+                record["return_value"] = None
             stack = _call_stack()
-            if stack and stack[-1] == call_id:
+            if stack and stack[-1] == record["call_id"]:
                 stack.pop()
         if state["previous_local"] is not None:
             state["previous_local"] = state["previous_local"](frame, event, arg)
@@ -180,14 +203,14 @@ def _make_local_tracer(call_id, previous_local):
 
 
 def _dispatch(frame, event, arg):
-    call_id = _trace_calls(frame)
+    record = _trace_calls(frame)
     previous = (
         _previous_trace
         if threading.current_thread() is _start_thread
         else _previous_thread_trace
     )
     previous_local = previous(frame, event, arg) if previous is not None else None
-    if call_id is None and previous_local is None:
+    if record is None and previous_local is None:
         # Nothing to do for this frame: we didn't record it (outside
         # target_dir, or not a real function call), and no other tool wants
         # to observe it either. Installing a no-op local tracer here would
@@ -196,12 +219,12 @@ def _dispatch(frame, event, arg):
         return None
     if previous_local is None:
         # No other tool is watching this frame, so "line" events (fired per
-        # source line, far more often than call/return) are pure overhead -
-        # we only need call/return. Can't suppress this when a previous
+        # source line, far more often than call/return/exception) are pure
+        # overhead - we don't need them. Can't suppress this when a previous
         # tracer IS chained in, since it might genuinely need line events
         # (e.g. coverage.py).
         frame.f_trace_lines = False
-    return _make_local_tracer(call_id, previous_local)
+    return _make_local_tracer(record, previous_local)
 
 
 def start(target_dir):

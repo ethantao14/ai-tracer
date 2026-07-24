@@ -606,6 +606,8 @@ def test_cli_trace_records_main_for_the_entry_script(tmp_path):
             "module": "__main__",
             "qualname": "main",
             "args": {},
+            "raised": False,
+            "return_value": 1,
         }
     ]
 
@@ -707,3 +709,47 @@ def test_cli_trace_includes_the_call_tree(tmp_path):
     assert trace[1]["qualname"] == "helper"
     assert trace[1]["parent_call_id"] == trace[0]["call_id"]
     assert trace[0]["call_id"] != trace[1]["call_id"]
+
+
+def test_cli_trace_includes_return_values_and_raised_status(tmp_path):
+    (tmp_path / "program.py").write_text(
+        "def doubles(x):\n"
+        "    return x * 2\n"
+        "\n"
+        "\n"
+        "def fails():\n"
+        "    raise ValueError('boom')\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    doubles(21)\n"
+        "    try:\n"
+        "        fails()\n"
+        "    except ValueError:\n"
+        "        pass\n"
+        "    return 'done'\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(tmp_path / "program.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    trace = json.loads((tmp_path / "program.trace.json").read_text())
+    by_qualname = {c["qualname"]: c for c in trace}
+    assert by_qualname["doubles"]["raised"] is False
+    assert by_qualname["doubles"]["return_value"] == 42
+    assert by_qualname["fails"]["raised"] is True
+    assert by_qualname["fails"]["return_value"] is None
+    # An explicit non-None return after catching is unambiguous, unlike an
+    # implicit `return None` after a catch (covered separately in
+    # test_tracer.py's ambiguity tests).
+    assert by_qualname["main"]["raised"] is False
+    assert by_qualname["main"]["return_value"] == "done"
