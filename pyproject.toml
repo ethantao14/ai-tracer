@@ -1,0 +1,13 @@
+[project]
+name = "ai-tracer"
+version = "0.1.0"
+description = "Generate pytest tests by tracing real function input/output"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
