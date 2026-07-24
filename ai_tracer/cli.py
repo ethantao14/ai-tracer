@@ -45,14 +45,17 @@ def run(target_path, program_args=(), restore=True, trace_output=None):
         runpy.run_path(str(target_path), run_name="__main__")
     finally:
         # Write the trace even if the target crashed, an uncaught exception
-        # is exactly what should be recorded, not lost.
+        # is exactly what should be recorded, not lost. Restoration below
+        # must still happen even if the write itself fails.
         calls = tracer.stop()
-        Path(trace_output).write_text(json.dumps(calls, indent=2))
-        if restore:
-            sys.argv = original_argv
-            sys.path[:] = original_sys_path
-            sys.modules.clear()
-            sys.modules.update(original_sys_modules)
+        try:
+            Path(trace_output).write_text(json.dumps(calls, indent=2))
+        finally:
+            if restore:
+                sys.argv = original_argv
+                sys.path[:] = original_sys_path
+                sys.modules.clear()
+                sys.modules.update(original_sys_modules)
 
 
 def main():

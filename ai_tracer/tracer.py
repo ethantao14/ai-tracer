@@ -1,10 +1,12 @@
 import inspect
 import sys
+import threading
 from pathlib import Path
 
 _target_dir = None
 _calls = []
 _previous_trace = None
+_previous_thread_trace = None
 
 
 def _trace_calls(frame, event, arg):
@@ -22,11 +24,15 @@ def _trace_calls(frame, event, arg):
 
 
 def start(target_dir):
-    global _target_dir, _previous_trace
+    global _target_dir, _previous_trace, _previous_thread_trace
     _target_dir = Path(target_dir).resolve()
     _calls.clear()
     _previous_trace = sys.gettrace()
+    _previous_thread_trace = threading.gettrace()
     sys.settrace(_trace_calls)
+    # sys.settrace only covers the current thread, threads the target
+    # itself starts need this too or their calls go unrecorded.
+    threading.settrace(_trace_calls)
 
 
 def stop():
@@ -34,4 +40,5 @@ def stop():
     # than hardcoding None, so an in-process caller's own tracing (e.g.
     # coverage) isn't clobbered.
     sys.settrace(_previous_trace)
+    threading.settrace(_previous_thread_trace)
     return list(_calls)

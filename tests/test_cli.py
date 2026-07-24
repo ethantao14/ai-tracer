@@ -353,6 +353,23 @@ def test_run_restores_sys_path_and_argv_even_if_the_target_crashes(tmp_path):
     assert sys.argv == original_argv
 
 
+def test_run_restores_state_even_if_writing_the_trace_fails(tmp_path):
+    original_path = list(sys.path)
+    original_argv = list(sys.argv)
+
+    target = tmp_path / "program.py"
+    target.write_text("x = 1\n")
+    bad_trace_output = tmp_path / "missing_dir" / "trace.json"
+
+    try:
+        cli.run(str(target), trace_output=bad_trace_output)
+    except OSError:
+        pass
+
+    assert sys.path == original_path
+    assert sys.argv == original_argv
+
+
 def test_cli_writes_a_trace_of_the_functions_the_target_calls(tmp_path):
     (tmp_path / "program.py").write_text(
         "def helper():\n"

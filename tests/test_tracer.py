@@ -1,4 +1,5 @@
 import sys
+import threading
 
 from ai_tracer import tracer
 
@@ -96,3 +97,28 @@ def test_stop_restores_no_tracer_when_none_was_active():
     tracer.stop()
 
     assert sys.gettrace() is None
+
+
+def test_records_calls_made_on_a_worker_thread():
+    tracer.start("tests")
+    thread = threading.Thread(target=sample_function)
+    thread.start()
+    thread.join()
+    calls = tracer.stop()
+
+    assert calls == [{"qualname": "sample_function"}]
+
+
+def test_stop_restores_the_previous_thread_tracer():
+    def other_tracer(frame, event, arg):
+        return other_tracer
+
+    threading.settrace(other_tracer)
+    try:
+        tracer.start("tests")
+        sample_function()
+        tracer.stop()
+
+        assert threading.gettrace() is other_tracer
+    finally:
+        threading.settrace(None)
