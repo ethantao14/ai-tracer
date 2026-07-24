@@ -91,6 +91,8 @@ Not every recorded call becomes a test. A call is skipped, with a one-line reaso
 
 **Known limitation (default arguments):** the trace records every parameter present in the call frame, including ones the caller left at their default, and can't tell an omitted argument from one passed explicitly. The generated test always passes each recorded argument by keyword. For the overwhelmingly common cases (immutable defaults like `None`, numbers, strings) this is exactly correct. It only misbehaves for a parameter whose default is a JSON-serializable object the function then compares by identity (e.g. `DEFAULT = {}` used as a sentinel via `x is DEFAULT`): the generated call passes a fresh equal object rather than the original default, so an identity check flips. Fixing this properly needs the tracer to record which arguments were passed explicitly, which is out of scope here.
 
+**Known limitation (order-dependent shared state):** each generated test asserts that a function, called with the recorded arguments, returns the recorded value - it assumes the function's result depends only on its arguments. A function whose result also depends on shared mutable state, and on the order calls happened in, isn't faithfully captured this way. Calls within one module keep their traced order, but pytest runs one module's tests independently of another's, so a return value that only held because some other module's function ran first can assert a value that no longer matches. This is inherent to turning individual recorded calls into independent tests, not something the generator can reorder its way out of.
+
 ---
 
 ## Development

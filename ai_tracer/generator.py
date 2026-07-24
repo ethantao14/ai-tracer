@@ -326,8 +326,14 @@ def _render_conftest(target_dir):
         "",
         f"sys.path.insert(0, {target_dir!r})",
         "",
-        f"for _cached in {tuple(local)!r}:",
-        "    sys.modules.pop(_cached, None)",
+        "# Clear every cached module whose top-level name the target dir defines",
+        "# - the module itself, a sibling it imports, a package and any of its",
+        "# already-cached submodules (popping just the package root would leave",
+        "# a stale pkg.sub behind). Matches how ai-tracer imports target code.",
+        f"_local = {tuple(local)!r}",
+        "for _name in list(sys.modules):",
+        "    if _name.split('.')[0] in _local:",
+        "        del sys.modules[_name]",
     ]
     return "\n".join(lines) + "\n"
 

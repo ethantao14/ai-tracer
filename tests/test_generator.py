@@ -751,8 +751,11 @@ def test_conftest_evicts_cached_target_modules_once_for_the_session(tmp_path):
     assert f"sys.path.insert(0, {str(tmp_path.resolve())!r})" in conftest
     # Both the module under test and its sibling are evicted in the conftest.
     assert "'helper'" in conftest and "'config'" in conftest
-    # The per-file eviction loop is gone; test files just import.
-    assert "for _cached in " not in (output_dir / "test_helper.py").read_text()
+    # Eviction is by top-level name, so a cached pkg.sub is cleared too, not
+    # only the bare package root.
+    assert "_name.split('.')[0] in _local" in conftest
+    # Test files no longer do their own eviction; they just import.
+    assert "_local" not in (output_dir / "test_helper.py").read_text()
 
 
 def test_does_not_overwrite_a_users_existing_conftest(tmp_path, capsys):
