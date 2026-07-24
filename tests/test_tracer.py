@@ -1,3 +1,4 @@
+import math
 import sys
 import threading
 
@@ -282,9 +283,10 @@ def sample_function_with_an_arg_that_breaks_json_encoding(value):
     return value
 
 
-def test_falls_back_to_repr_when_json_encoding_raises_something_unexpected():
-    # A container subclass can make json.dumps raise something other than
-    # the TypeError/ValueError it raises for ordinary unserializable values.
+def test_falls_back_to_repr_for_a_list_subclass_with_a_raising_iter():
+    # A list/dict subclass is never introspected directly (see
+    # _to_json_safe), so this falls back to repr() without ever calling the
+    # subclass's own __iter__.
     broken = _RaisesDuringIteration([1, 2])
 
     tracer.start("tests")
@@ -296,6 +298,57 @@ def test_falls_back_to_repr_when_json_encoding_raises_something_unexpected():
             "qualname": "sample_function_with_an_arg_that_breaks_json_encoding",
             "args": {"value": repr(broken)},
         }
+    ]
+
+
+class _MutatesSelfOnIteration(list):
+    def __iter__(self):
+        self.clear()
+        return super().__iter__()
+
+
+def sample_function_with_a_side_effecting_arg(value):
+    return value
+
+
+def test_snapshotting_a_side_effecting_container_subclass_does_not_mutate_it():
+    # A naive json.dumps(value) would call this subclass's own __iter__,
+    # mutating the target's actual argument as a side effect of merely being
+    # traced. The snapshot must never touch a subclass's overridable methods.
+    tricky = _MutatesSelfOnIteration([1, 2, 3])
+
+    tracer.start("tests")
+    sample_function_with_a_side_effecting_arg(tricky)
+    calls = tracer.stop()
+
+    assert tricky == [1, 2, 3]
+    assert calls == [
+        {
+            "qualname": "sample_function_with_a_side_effecting_arg",
+            "args": {"value": repr(tricky)},
+        }
+    ]
+
+
+def sample_function_with_a_non_finite_float_arg(value):
+    return value
+
+
+def test_falls_back_to_repr_for_nan_and_infinity():
+    tracer.start("tests")
+    sample_function_with_a_non_finite_float_arg(math.nan)
+    sample_function_with_a_non_finite_float_arg(math.inf)
+    calls = tracer.stop()
+
+    assert calls == [
+        {
+            "qualname": "sample_function_with_a_non_finite_float_arg",
+            "args": {"value": "nan"},
+        },
+        {
+            "qualname": "sample_function_with_a_non_finite_float_arg",
+            "args": {"value": "inf"},
+        },
     ]
 
 

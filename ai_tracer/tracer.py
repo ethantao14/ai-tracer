@@ -1,10 +1,11 @@
 import inspect
-import json
+import math
 import sys
 import threading
 from pathlib import Path
 
 _SYNTHETIC_FRAME_NAMES = {"<listcomp>", "<dictcomp>", "<setcomp>", "<genexpr>"}
+_JSON_SAFE_SCALAR_TYPES = (str, int, bool, type(None))
 
 _target_dir = None
 _start_cwd = None
@@ -14,16 +15,40 @@ _previous_trace = None
 _previous_thread_trace = None
 
 
+def _to_json_safe(value):
+    # Dispatch on the value's *exact* type, never a subclass: iterating a
+    # plain list/dict can't run user code, but a subclass could override
+    # __iter__/keys()/etc. with side effects, and json.dumps would call
+    # straight into those while we're just trying to observe the argument.
+    value_type = type(value)
+    if value_type is float:
+        if not math.isfinite(value):
+            # json.dumps emits bare NaN/Infinity, which isn't valid JSON and
+            # would corrupt the .trace.json file it ends up written into.
+            raise ValueError(f"non-finite float: {value!r}")
+        return value
+    if value_type in _JSON_SAFE_SCALAR_TYPES:
+        return value
+    if value_type is list or value_type is tuple:
+        return [_to_json_safe(item) for item in value]
+    if value_type is dict:
+        result = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError(f"non-string dict key: {key!r}")
+            result[key] = _to_json_safe(item)
+        return result
+    raise TypeError(f"not a JSON-safe value: {value_type.__name__}")
+
+
 def _snapshot(value):
-    # Round-tripping through JSON freezes the value as of this exact moment
-    # (later mutation by the traced code can't change what we recorded) and
-    # falls back to repr for anything that isn't JSON-serializable (e.g. self).
+    # Freezes the value as of this exact moment (later mutation by the
+    # traced code can't change what we recorded) and falls back to repr for
+    # anything that isn't a JSON-safe builtin (e.g. self, or a container
+    # subclass we deliberately don't introspect, see _to_json_safe).
     try:
-        return json.loads(json.dumps(value))
-    except Exception:  # noqa: BLE001 - any encoding failure must not abort the target
-        # Not just TypeError (non-serializable, e.g. self) or ValueError
-        # (circular containers): a container subclass with a raising
-        # __iter__/__repr__/keys() can make the encoder raise anything.
+        return _to_json_safe(value)
+    except Exception:  # noqa: BLE001 - any snapshot failure must not abort the target
         try:
             return repr(value)
         except Exception:  # noqa: BLE001 - a raising __repr__ must not abort the target

@@ -514,3 +514,34 @@ def test_cli_trace_includes_the_arguments_a_function_was_called_with(tmp_path):
         {"qualname": "main", "args": {}},
         {"qualname": "add", "args": {"a": 1, "b": 2}},
     ]
+
+
+def test_cli_trace_stays_valid_json_for_a_nan_argument(tmp_path):
+    (tmp_path / "program.py").write_text(
+        "def take(value):\n"
+        "    return value\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    take(float('nan'))\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(tmp_path / "program.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    raw = (tmp_path / "program.trace.json").read_text()
+    assert "NaN" not in raw
+    trace = json.loads(raw)
+    assert trace == [
+        {"qualname": "main", "args": {}},
+        {"qualname": "take", "args": {"value": "nan"}},
+    ]
