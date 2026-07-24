@@ -950,6 +950,89 @@ def test_a_call_that_did_not_raise_has_null_exception_fields():
     assert calls[0]["exception_module"] is None
 
 
+def sample_function_that_reraises_a_different_type():
+    try:
+        raise ValueError("first")
+    except ValueError:
+        raise KeyError("second")
+
+
+def test_records_the_reraised_exception_not_the_caught_one():
+    # `except A: raise B` - the exception that actually escapes is B, and
+    # that's what the last "exception" event carries, so it's recorded.
+    tracer.start("tests")
+    try:
+        sample_function_that_reraises_a_different_type()
+    except KeyError:
+        pass
+    calls = tracer.stop()
+
+    assert calls[0]["exception_type"] == "KeyError"
+
+
+_METACLASS_MODULE_PROPERTY_RAN = []
+
+
+class _SideEffectingExceptionMeta(type):
+    @property
+    def __module__(cls):
+        _METACLASS_MODULE_PROPERTY_RAN.append(True)
+        return "faked_module"
+
+
+class _ExceptionWithSideEffectingMeta(Exception, metaclass=_SideEffectingExceptionMeta):
+    pass
+
+
+def sample_function_that_raises_a_metaclass_exception():
+    raise _ExceptionWithSideEffectingMeta("boom")
+
+
+def test_recording_an_exception_never_runs_a_metaclass_module_property():
+    # Reading exc_type.__module__ directly would invoke this metaclass
+    # property (target code running just because we observed an exception).
+    # type's own descriptor is used instead, which returns the real module
+    # and never triggers the property.
+    _METACLASS_MODULE_PROPERTY_RAN.clear()
+
+    tracer.start("tests")
+    try:
+        sample_function_that_raises_a_metaclass_exception()
+    except _ExceptionWithSideEffectingMeta:
+        pass
+    calls = tracer.stop()
+
+    assert _METACLASS_MODULE_PROPERTY_RAN == []
+    assert calls[0]["exception_type"] == "_ExceptionWithSideEffectingMeta"
+    assert calls[0]["exception_module"] == "test_tracer"
+
+
+def sample_function_with_a_finally_that_raises_and_catches():
+    try:
+        raise ValueError("escapes")
+    finally:
+        try:
+            raise KeyError("handled in finally")
+        except KeyError:
+            pass
+
+
+def test_finally_that_raises_and_catches_records_the_finally_exception():
+    # Documented limitation: the ValueError is what actually escapes, but the
+    # finally block's KeyError is the last "exception" event and the escaping
+    # ValueError re-emerges without another event, so KeyError is what gets
+    # recorded here. `raised` is still correctly True.
+    tracer.start("tests")
+    try:
+        sample_function_with_a_finally_that_raises_and_catches()
+    except ValueError:
+        pass
+    calls = tracer.stop()
+
+    assert calls[0]["raised"] is True
+    assert calls[0]["exception_type"] == "KeyError"
+
+
 def sample_function_that_catches_and_returns():
     try:
         raise ValueError("boom")

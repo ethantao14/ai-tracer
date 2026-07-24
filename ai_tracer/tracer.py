@@ -98,20 +98,24 @@ def _snapshot(value):
 
 def _exception_info(exc_type):
     # The module and qualified name of the exception class that propagated out
-    # of a call. Both are read via type.__getattribute__ - the unbound base
-    # implementation - so a custom metaclass overriding __getattribute__ can't
-    # run target code while we observe (same reasoning as object.__repr__ in
-    # _snapshot). Each is then snapshotted, so a class with a non-string
-    # __module__/__qualname__ can't break the final json.dumps of the trace.
-    # __module__ here is consistent with how function calls are recorded: a
-    # target exception defined in the entry script reads "__main__", matching
-    # the function-frame module resolution, and a builtin reads "builtins".
+    # of a call. Read through `type`'s own __module__/__qualname__ getset
+    # descriptors (bound to exc_type), which sidesteps any custom metaclass:
+    # plain `exc_type.__module__` would run a metaclass's __getattribute__ or,
+    # worse, a metaclass property named __module__ - target code that could
+    # mutate state just because we're observing an exception. type's base
+    # descriptors run no target code and still return the real value for both
+    # builtins ("builtins"/"ValueError") and target classes. Each is then
+    # snapshotted, so a class with a non-string __module__/__qualname__ can't
+    # break the final json.dumps of the trace. __module__ here is consistent
+    # with how function calls are recorded: a target exception defined in the
+    # entry script reads "__main__", matching the function-frame module
+    # resolution, and a builtin reads "builtins".
     try:
-        module = type.__getattribute__(exc_type, "__module__")
+        module = type.__dict__["__module__"].__get__(exc_type)
     except Exception:  # noqa: BLE001 - reading a target class attr must never abort
         module = None
     try:
-        qualname = type.__getattribute__(exc_type, "__qualname__")
+        qualname = type.__dict__["__qualname__"].__get__(exc_type)
     except Exception:  # noqa: BLE001 - reading a target class attr must never abort
         qualname = None
     module_value, _ = _snapshot(module)
@@ -204,9 +208,16 @@ def _make_local_tracer(record, previous_local):
         if record is not None and event == "exception":
             state["saw_exception"] = True
             # arg is (exc_type, exc_value, traceback). Keep the latest one:
-            # the exception actually unwinding out of the frame is the last
-            # one seen before it exits, and only that one is recorded if the
-            # frame turns out to have raised.
+            # the exception actually unwinding out of the frame is usually the
+            # last one seen before it exits, and only that one is recorded if
+            # the frame turns out to have raised. This is right for the common
+            # re-raise pattern (`except A: raise B` - B is what escapes). It's
+            # wrong only in the rare case where a `finally` block itself raises
+            # and catches a *different* exception while the original keeps
+            # propagating: the original re-emerges with no further "exception"
+            # event, and sys.exc_info() is already cleared by the "return"
+            # event, so the last-seen exception is the finally's handled one,
+            # not the escaping one. Accepted, documented limitation.
             state["exc_type"] = arg[0]
         elif record is not None and event == "return":
             # "return" fires for every frame exit, exceptional or not, with
