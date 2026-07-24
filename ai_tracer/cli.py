@@ -1,4 +1,3 @@
-import argparse
 import runpy
 import sys
 from pathlib import Path
@@ -34,15 +33,20 @@ def run(target_path, program_args=()):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="ai-tracer")
-    parser.add_argument("program", help="Run a target Python program")
-    parser.add_argument(
-        "program_args",
-        nargs=argparse.REMAINDER,
-        help="Arguments to pass through to the target program",
-    )
-    args = parser.parse_args()
-    run(args.program, args.program_args)
+    # Not using argparse here: everything after the program path is opaque
+    # pass-through to the target, and argparse.REMAINDER silently swallows
+    # a leading "--" right after the last positional (its own convention for
+    # "stop parsing options here"), so `run.sh app.py -- --flag` would
+    # forward ['--flag'] instead of ['--', '--flag'], different from what
+    # `python app.py -- --flag` actually does. A plain slice has no such
+    # reinterpretation, whatever follows the program path reaches the
+    # target verbatim.
+    argv = sys.argv[1:]
+    if not argv:
+        print("usage: ai-tracer <program> [program_args...]", file=sys.stderr)
+        sys.exit(1)
+    program, *program_args = argv
+    run(program, program_args)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,18 @@ import sys
 from ai_tracer import cli
 
 
+def test_cli_prints_usage_and_exits_nonzero_with_no_arguments():
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "usage" in result.stderr.lower()
+
+
 def test_cli_runs_a_target_program(tmp_path):
     marker = tmp_path / "ran.txt"
     (tmp_path / "program.py").write_text(
@@ -99,6 +111,42 @@ def test_cli_forwards_extra_arguments_to_the_target_program(tmp_path):
             str(tmp_path / "argvy.py"),
             "--config",
             "cfg.yml",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_cli_forwards_a_literal_double_dash_to_the_target_program(tmp_path):
+    # argparse.REMAINDER would silently swallow a leading "--" right after
+    # the program path (its own convention for "stop parsing options"),
+    # forwarding ['--flag'] instead of ['--', '--flag']. A target that uses
+    # "--" itself, e.g. to separate its own flags from positional
+    # arguments, needs to see it preserved, same as `python app.py --
+    # --flag` would.
+    (tmp_path / "argvy.py").write_text(
+        "import sys\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    assert sys.argv[1:] == ['--', '--flag'], sys.argv\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ai_tracer.cli",
+            str(tmp_path / "argvy.py"),
+            "--",
+            "--flag",
         ],
         capture_output=True,
         text=True,
