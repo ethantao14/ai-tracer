@@ -723,11 +723,15 @@ def test_does_not_overwrite_a_user_file_sharing_the_generated_name(tmp_path):
     assert (output_dir / "test_helper_1.py").exists()
 
 
-def test_generated_test_evicts_the_cached_module_before_importing(tmp_path):
-    # The generated test pops the target module from sys.modules before
-    # importing, so it loads the target's own module even if a same-named one
-    # is already cached (a prior test, or a stdlib module the target shadows).
-    (tmp_path / "helper.py").write_text("def f():\n    return 1\n")
+def test_generated_test_evicts_cached_target_modules_before_importing(tmp_path):
+    # The generated test evicts the target's own modules from sys.modules
+    # before importing - not only the module under test, but every target
+    # sibling too - so it loads the target's own versions even if same-named
+    # modules are already cached, then imports.
+    (tmp_path / "config.py").write_text("VALUE = 1\n")
+    (tmp_path / "helper.py").write_text(
+        "from config import VALUE\n\n\ndef f():\n    return VALUE\n"
+    )
     trace_path = _trace(
         tmp_path,
         "from helper import f\n"
@@ -745,10 +749,37 @@ def test_generated_test_evicts_the_cached_module_before_importing(tmp_path):
     generator.generate(str(trace_path), str(tmp_path), str(output_dir))
 
     source = (output_dir / "test_helper.py").read_text()
-    assert "sys.modules.pop('helper', None)" in source
-    assert source.index("sys.modules.pop('helper', None)") < source.index(
-        "from helper import f"
+    eviction = "for _cached in "
+    # Both the module under test and its sibling are evicted, before the import.
+    assert "'helper'" in source and "'config'" in source
+    assert source.index(eviction) < source.index("from helper import f")
+
+
+def test_skips_a_module_that_calls_sys_exit_at_import(tmp_path, capsys):
+    # A target module that exits at import (sys.exit(), argparse, etc.) raises
+    # SystemExit, which is a BaseException - it must be reported as an import
+    # failure and skipped, not left to abort the whole generation run.
+    (tmp_path / "helper.py").write_text("def works():\n    return 1\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import works\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    works()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
     )
+    (tmp_path / "helper.py").write_text("import sys\n\nsys.exit(2)\n")
+
+    written = generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert written == []
+    assert "could not be imported" in capsys.readouterr().err
 
 
 def test_skips_a_call_whose_module_name_is_a_non_string(tmp_path, capsys):

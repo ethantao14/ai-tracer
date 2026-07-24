@@ -234,7 +234,13 @@ def _get_module(module_name, module_cache):
     if module_name not in module_cache:
         try:
             module_cache[module_name] = importlib.import_module(module_name)
-        except Exception:  # noqa: BLE001 - importing target code can raise anything
+        except (Exception, SystemExit):  # noqa: BLE001 - target import can raise anything
+            # Importing re-runs the target's top-level code, which can raise
+            # anything - including SystemExit (a BaseException, not an
+            # Exception) from a module that calls sys.exit() or parses args at
+            # import time. Both mean "not safely importable now", not "abort
+            # the whole generation run"; KeyboardInterrupt is deliberately left
+            # to propagate so the user can still cancel.
             module_cache[module_name] = None
     return module_cache[module_name]
 
@@ -290,14 +296,19 @@ def _render_test_module(module_name, module_calls, target_dir):
         "",
         f"sys.path.insert(0, {target_dir!r})",
     ]
-    # Evict the target module (and any parent package) before importing, so
-    # this test loads the target's own module even if a same-named one is
-    # already cached (a previous test, or a stdlib module the target shadows) -
-    # adding target_dir to sys.path isn't enough, since an existing
-    # sys.modules entry is returned before the path is ever searched.
+    # Evict every target-local module (and the module's own parent packages)
+    # before importing, so this test loads the target's own modules even when a
+    # same-named one is already cached - not just the module under test, but
+    # any sibling it imports (a target `config.py` shadowing a cached `config`)
+    # and any stdlib name the target shadows. Adding target_dir to sys.path
+    # isn't enough on its own: an existing sys.modules entry is returned before
+    # the path is ever searched. This mirrors what generate() does for its own
+    # imports.
     parts = module_name.split(".")
-    for i in range(len(parts)):
-        lines.append(f"sys.modules.pop({'.'.join(parts[: i + 1])!r}, None)")
+    prefixes = {".".join(parts[: i + 1]) for i in range(len(parts))}
+    evict = sorted(_local_module_names(target_dir) | prefixes)
+    lines.append(f"for _cached in {tuple(evict)!r}:")
+    lines.append("    sys.modules.pop(_cached, None)")
     lines.append(f"from {module_name} import {', '.join(imported_names)}")
 
     call_counts = {}
