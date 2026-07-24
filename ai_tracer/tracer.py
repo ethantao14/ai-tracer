@@ -3,7 +3,10 @@ import sys
 import threading
 from pathlib import Path
 
+_SYNTHETIC_FRAME_NAMES = {"<listcomp>", "<dictcomp>", "<setcomp>", "<genexpr>"}
+
 _target_dir = None
+_start_cwd = None
 _calls = []
 _previous_trace = None
 _previous_thread_trace = None
@@ -16,16 +19,30 @@ def _trace_calls(frame, event, arg):
     # Synthetic filenames like "<frozen importlib._bootstrap>" aren't real
     # files. CO_OPTIMIZED is unset for module-level code and class bodies
     # (both run as their own frame but aren't a real function call).
-    if co.co_filename.startswith("<") or not (co.co_flags & inspect.CO_OPTIMIZED):
+    # Comprehensions/genexprs get their own CO_OPTIMIZED frame with a real
+    # filename too, but aren't a function the target could call again.
+    if (
+        co.co_filename.startswith("<")
+        or not (co.co_flags & inspect.CO_OPTIMIZED)
+        or co.co_name in _SYNTHETIC_FRAME_NAMES
+    ):
         return
-    if not Path(co.co_filename).resolve().is_relative_to(_target_dir):
+    # The main script keeps whatever (possibly relative) path string it was
+    # given to preserve argv[0] fidelity. Resolve it against the cwd at
+    # start(), not whatever the target's cwd happens to be by the time this
+    # call fires, in case the target itself changes directory.
+    filename = Path(co.co_filename)
+    if not filename.is_absolute():
+        filename = _start_cwd / filename
+    if not filename.resolve().is_relative_to(_target_dir):
         return
     _calls.append({"qualname": co.co_qualname})
 
 
 def start(target_dir):
-    global _target_dir, _previous_trace, _previous_thread_trace
+    global _target_dir, _start_cwd, _previous_trace, _previous_thread_trace
     _target_dir = Path(target_dir).resolve()
+    _start_cwd = Path.cwd()
     _calls.clear()
     _previous_trace = sys.gettrace()
     _previous_thread_trace = threading.gettrace()

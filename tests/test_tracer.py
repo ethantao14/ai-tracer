@@ -122,3 +122,15 @@ def test_stop_restores_the_previous_thread_tracer():
         assert threading.gettrace() is other_tracer
     finally:
         threading.settrace(None)
+
+
+def sample_function_with_a_comprehension():
+    return [x * 2 for x in range(3)]
+
+
+def test_does_not_record_comprehension_frames():
+    tracer.start("tests")
+    sample_function_with_a_comprehension()
+    calls = tracer.stop()
+
+    assert calls == [{"qualname": "sample_function_with_a_comprehension"}]

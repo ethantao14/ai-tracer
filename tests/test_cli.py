@@ -441,3 +441,41 @@ def test_cli_trace_does_not_include_stdlib_calls(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     trace = json.loads((tmp_path / "program.trace.json").read_text())
     assert trace == [{"qualname": "main"}]
+
+
+def test_cli_trace_survives_the_target_changing_its_own_working_directory(tmp_path):
+    # A relative program path keeps a relative co_filename for functions
+    # defined in it. If the target then chdir()s, resolving that filename
+    # against the *current* cwd (instead of the cwd run() started in) would
+    # point at the wrong directory and silently drop these calls.
+    target_dir = tmp_path / "target_dir"
+    target_dir.mkdir()
+    (target_dir / "elsewhere").mkdir()
+    (target_dir / "program.py").write_text(
+        "import os\n"
+        "\n"
+        "\n"
+        "def after_chdir():\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    os.chdir('elsewhere')\n"
+        "    after_chdir()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", "program.py"],
+        cwd=target_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    trace = json.loads((target_dir / "program.trace.json").read_text())
+    assert trace == [{"qualname": "main"}, {"qualname": "after_chdir"}]
