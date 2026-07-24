@@ -271,6 +271,20 @@ def test_falls_back_to_repr_for_a_non_json_serializable_arg():
     ]
 
 
+def sample_function_with_two_args(a, b):
+    return a, b
+
+
+def test_tags_each_arg_with_its_serialization_kind():
+    obj = _NotJSONSerializable()
+
+    tracer.start("tests")
+    sample_function_with_two_args(1, obj)
+    calls = tracer.stop()
+
+    assert calls[0]["arg_serialization"] == {"a": "json", "b": "repr"}
+
+
 def sample_function_with_a_circular_arg(value):
     return value
 
@@ -596,8 +610,10 @@ def test_a_top_level_call_has_no_parent():
             "module": "test_tracer",
             "qualname": "sample_function",
             "args": {},
+            "arg_serialization": {},
             "raised": False,
             "return_value": "done",
+            "return_serialization": "json",
         }
     ]
 
@@ -853,6 +869,7 @@ def test_records_the_return_value_of_a_normal_call():
 
     assert calls[0]["raised"] is False
     assert calls[0]["return_value"] == 42
+    assert calls[0]["return_serialization"] == "json"
 
 
 def sample_function_with_no_return_statement():
@@ -882,6 +899,7 @@ def test_records_raised_true_when_an_exception_propagates_uncaught():
 
     assert calls[0]["raised"] is True
     assert calls[0]["return_value"] is None
+    assert calls[0]["return_serialization"] is None
 
 
 def sample_function_that_catches_and_returns():
@@ -961,6 +979,7 @@ def test_falls_back_to_repr_for_a_non_json_serializable_return_value():
     assert calls[0]["return_value"] == object.__repr__(
         _shared_non_serializable_return_value
     )
+    assert calls[0]["return_serialization"] == "repr"
 
 
 def test_records_each_generator_resumes_yielded_value_as_its_own_return_value():
