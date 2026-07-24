@@ -157,9 +157,10 @@ def test_generates_a_passing_pytest_raises_test_for_a_target_exception(tmp_path)
     generator.generate(str(trace_path), str(tmp_path), str(output_dir))
 
     source = (output_dir / "test_helper.py").read_text()
-    # The exception module is imported qualified and referenced by dotted name.
-    assert "import errors" in source
-    assert "with pytest.raises(errors.AppError):" in source
+    # The exception module is imported under a reserved alias and referenced
+    # through it, so it can't be shadowed by a same-named function import.
+    assert "import errors as _raises_errors" in source
+    assert "with pytest.raises(_raises_errors.AppError):" in source
     assert "boom(x=3)" in source
 
     result = subprocess.run(
@@ -170,6 +171,96 @@ def test_generates_a_passing_pytest_raises_test_for_a_target_exception(tmp_path)
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed" in result.stdout
+
+
+def test_exception_module_alias_survives_a_same_named_function(tmp_path):
+    # helper defines both a function `errors` and raises `errors.AppError` from
+    # a sibling `errors` module. The exception module's reserved alias must not
+    # be shadowed by `from helper import errors`, or pytest.raises would
+    # resolve `errors` to the function and the test would fail.
+    (tmp_path / "errors.py").write_text("class AppError(Exception):\n    pass\n")
+    (tmp_path / "helper.py").write_text(
+        "from errors import AppError\n"
+        "\n"
+        "\n"
+        "def errors():\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "def boom():\n"
+        "    raise AppError('x')\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import errors, boom\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    errors()\n"
+        "    try:\n"
+        "        boom()\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    source = (output_dir / "test_helper.py").read_text()
+    # The function `errors` is imported, and the exception module is aliased.
+    assert "from helper import boom, errors" in source
+    assert "import errors as _raises_errors" in source
+    assert "with pytest.raises(_raises_errors.AppError):" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout
+
+
+def test_emits_pytest_raises_for_the_recorded_raised_flag_even_if_a_false_positive(
+    tmp_path,
+):
+    # Documented, accepted limitation: the generator trusts the trace's raised
+    # flag (it never re-runs the function to second-guess it). A function that
+    # catches its own exception and returns None is recorded as raised, so a
+    # pytest.raises test is emitted for it. That generated test would fail when
+    # run (the function actually returns None), which is the known tradeoff of
+    # trusting the recording - so this asserts the emitted shape, not a passing
+    # run.
+    (tmp_path / "helper.py").write_text(
+        "def safe_get(d, k):\n"
+        "    try:\n"
+        "        return d[k]\n"
+        "    except KeyError:\n"
+        "        return None\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import safe_get\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    safe_get({'a': 1}, 'missing')\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    source = (output_dir / "test_helper.py").read_text()
+    assert "with pytest.raises(KeyError):" in source
 
 
 def test_skips_a_raised_call_whose_exception_module_is_the_entry_script(

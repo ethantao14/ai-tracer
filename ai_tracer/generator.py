@@ -435,11 +435,13 @@ def _render_test_module(module_name, module_calls, target_dir):
         result_var = "_" + result_var
 
     has_raises = any(call["raised"] for call in module_calls)
-    # Exception modules are imported qualified (`import errors`, referenced as
-    # `errors.AppError`), never `from errors import AppError`, so they can't
-    # collide with the function names pulled in below - even when the exception
-    # lives in the same module as the function under test. Built-in exceptions
-    # need no import and are referenced by bare name.
+    # Each non-builtin exception module is imported under a reserved alias
+    # (`import errors as _raises_errors`) rather than its own name, so it can't
+    # be shadowed by a function of the same name imported from module_name (a
+    # target `errors()` function alongside an `errors.AppError` exception), and
+    # so it never uses `from errors import AppError` (which would collide with
+    # an imported `AppError` function). Built-in exceptions need no import and
+    # are referenced by bare name.
     exception_modules = sorted(
         {
             call["exception_module"]
@@ -447,6 +449,12 @@ def _render_test_module(module_name, module_calls, target_dir):
             if call["raised"] and call["exception_module"] != "builtins"
         }
     )
+    exception_aliases = {}
+    for exception_module in exception_modules:
+        alias = "_raises_" + exception_module.replace(".", "_")
+        while alias in imported_names or alias in exception_aliases.values():
+            alias = "_" + alias
+        exception_aliases[exception_module] = alias
 
     # The conftest.py generated alongside this file evicts stale/shadowing
     # target modules once for the whole session; this per-file sys.path.insert
@@ -457,7 +465,9 @@ def _render_test_module(module_name, module_calls, target_dir):
         lines.append("import pytest")
     lines += ["", f"sys.path.insert(0, {target_dir!r})"]
     for exception_module in exception_modules:
-        lines.append(f"import {exception_module}")
+        lines.append(
+            f"import {exception_module} as {exception_aliases[exception_module]}"
+        )
     lines.append(f"from {module_name} import {', '.join(imported_names)}")
 
     call_counts = {}
@@ -470,7 +480,8 @@ def _render_test_module(module_name, module_calls, target_dir):
         lines += ["", ""]
         lines.append(f"def test_{qualname}_{index}():")
         if call["raised"]:
-            lines.append(f"    with pytest.raises({_exception_reference(call)}):")
+            reference = _exception_reference(call, exception_aliases)
+            lines.append(f"    with pytest.raises({reference}):")
             lines.append(f"        {qualname}({args})")
         else:
             lines.append(f"    {result_var} = {qualname}({args})")
@@ -479,13 +490,13 @@ def _render_test_module(module_name, module_calls, target_dir):
     return "\n".join(lines) + "\n"
 
 
-def _exception_reference(call):
+def _exception_reference(call, exception_aliases):
     # How the exception is named in a `pytest.raises(...)`: a bare identifier
-    # for a builtin (ValueError), or module-qualified for a target exception
-    # (errors.AppError), matching how its module was imported.
+    # for a builtin (ValueError), or its module's reserved alias plus the type
+    # for a target exception (_raises_errors.AppError).
     if call["exception_module"] == "builtins":
         return call["exception_type"]
-    return f"{call['exception_module']}.{call['exception_type']}"
+    return f"{exception_aliases[call['exception_module']]}.{call['exception_type']}"
 
 
 def main():
