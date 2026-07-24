@@ -26,6 +26,12 @@ pip install -e ".[dev]"
 
 This runs the target program the same way `python path/to/your_program.py` would, just through ai-tracer's own harness.
 
+Any extra arguments are forwarded to the target program:
+
+```bash
+./scripts/run.sh path/to/your_program.py --some-flag value
+```
+
 ---
 
 ## Development
