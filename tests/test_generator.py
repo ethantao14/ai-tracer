@@ -755,6 +755,55 @@ def test_generated_test_evicts_cached_target_modules_before_importing(tmp_path):
     assert source.index(eviction) < source.index("from helper import f")
 
 
+def test_generated_tests_for_two_submodules_share_one_package_init(tmp_path):
+    # pytest imports all generated files in one process. If each test file
+    # evicted the shared package before importing its own submodule, the
+    # package's __init__ would re-run per file; a submodule reading a value the
+    # __init__ increments would then see a different value than the traced run.
+    # The generated tests must not do that - __init__ runs once for the run.
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        "import itertools\n\nCOUNTER = itertools.count()\nTOKEN = next(COUNTER)\n"
+    )
+    (pkg / "a.py").write_text(
+        "from pkg import TOKEN\n\n\ndef fa():\n    return TOKEN\n"
+    )
+    (pkg / "b.py").write_text(
+        "from pkg import TOKEN\n\n\ndef fb():\n    return TOKEN\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from pkg.a import fa\n"
+        "from pkg.b import fb\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    fa()\n"
+        "    fb()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+    assert {p.name for p in written} == {"test_pkg_a.py", "test_pkg_b.py"}
+
+    # Both submodules traced TOKEN == 0. Running both generated files together
+    # (one pytest process) must keep that true, which only holds if __init__
+    # ran once. A per-file package eviction would make the second file see 1.
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout
+
+
 def test_skips_a_module_that_calls_sys_exit_at_import(tmp_path, capsys):
     # A target module that exits at import (sys.exit(), argparse, etc.) raises
     # SystemExit, which is a BaseException - it must be reported as an import

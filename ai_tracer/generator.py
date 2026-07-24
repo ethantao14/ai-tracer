@@ -57,14 +57,23 @@ def _would_clobber(path):
     return path.exists() and not _is_generated_file(path)
 
 
-def _local_module_names(target_dir):
-    names = set()
+def _local_top_level(target_dir):
+    # Split the target dir's top-level importable names into plain modules
+    # (single .py files) and packages (directories with __init__.py). The
+    # distinction matters for eviction: re-importing a plain module is
+    # harmless, but re-importing a package re-runs its __init__.py.
+    modules, packages = set(), set()
     for entry in Path(target_dir).iterdir():
         if entry.is_file() and entry.suffix == ".py":
-            names.add(entry.stem)
+            modules.add(entry.stem)
         elif entry.is_dir() and (entry / "__init__.py").is_file():
-            names.add(entry.name)
-    return names
+            packages.add(entry.name)
+    return modules, packages
+
+
+def _local_module_names(target_dir):
+    modules, packages = _local_top_level(target_dir)
+    return modules | packages
 
 
 def generate(trace_log_path, target_dir, output_dir="generated_tests"):
@@ -296,18 +305,22 @@ def _render_test_module(module_name, module_calls, target_dir):
         "",
         f"sys.path.insert(0, {target_dir!r})",
     ]
-    # Evict every target-local module (and the module's own parent packages)
-    # before importing, so this test loads the target's own modules even when a
-    # same-named one is already cached - not just the module under test, but
-    # any sibling it imports (a target `config.py` shadowing a cached `config`)
-    # and any stdlib name the target shadows. Adding target_dir to sys.path
-    # isn't enough on its own: an existing sys.modules entry is returned before
-    # the path is ever searched. This mirrors what generate() does for its own
-    # imports.
-    parts = module_name.split(".")
-    prefixes = {".".join(parts[: i + 1]) for i in range(len(parts))}
-    evict = sorted(_local_module_names(target_dir) | prefixes)
-    lines.append(f"for _cached in {tuple(evict)!r}:")
+    # Evict target-local modules before importing, so this test loads the
+    # target's own modules even when a same-named one is already cached - not
+    # just the module under test, but any plain sibling it imports (a target
+    # config.py shadowing a cached config) and any stdlib name the target
+    # shadows. Adding target_dir to sys.path isn't enough on its own: an
+    # existing sys.modules entry is returned before the path is ever searched.
+    # Package names are deliberately never evicted here: pytest imports all
+    # generated files in one process, so re-evicting a shared package would
+    # re-run its __init__.py per file, which submodules of that package could
+    # observe as changed state. A package is imported once by whichever test
+    # file needs it first and reused thereafter, exactly like a normal run.
+    modules, packages = _local_top_level(target_dir)
+    evict = set(modules)
+    if module_name not in packages:
+        evict.add(module_name)
+    lines.append(f"for _cached in {tuple(sorted(evict))!r}:")
     lines.append("    sys.modules.pop(_cached, None)")
     lines.append(f"from {module_name} import {', '.join(imported_names)}")
 
