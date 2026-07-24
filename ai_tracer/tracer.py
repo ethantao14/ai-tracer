@@ -1,4 +1,5 @@
 import inspect
+import itertools
 import math
 import sys
 import threading
@@ -13,6 +14,19 @@ _start_thread = None
 _calls = []
 _previous_trace = None
 _previous_thread_trace = None
+_call_id_counter = itertools.count()
+_thread_local = threading.local()
+
+
+def _call_stack():
+    # Each thread gets its own independent stack (and therefore its own
+    # call-tree root), matching per-thread call nesting; frame.f_back never
+    # links across threads, so there's nothing to reconcile between them.
+    stack = getattr(_thread_local, "stack", None)
+    if stack is None:
+        stack = []
+        _thread_local.stack = stack
+    return stack
 
 
 def _to_json_safe(value):
@@ -78,9 +92,7 @@ def _snapshot(value):
         return object.__repr__(value)
 
 
-def _trace_calls(frame, event, arg):
-    if event != "call":
-        return
+def _trace_calls(frame):
     co = frame.f_code
     # Synthetic filenames like "<frozen importlib._bootstrap>" aren't real
     # files. CO_OPTIMIZED is unset for module-level code and class bodies
@@ -92,7 +104,7 @@ def _trace_calls(frame, event, arg):
         or not (co.co_flags & inspect.CO_OPTIMIZED)
         or co.co_name in _SYNTHETIC_FRAME_NAMES
     ):
-        return
+        return None
     # The main script keeps whatever (possibly relative) path string it was
     # given to preserve argv[0] fidelity. Resolve it against the cwd at
     # start(), not whatever the target's cwd happens to be by the time this
@@ -101,7 +113,7 @@ def _trace_calls(frame, event, arg):
     if not filename.is_absolute():
         filename = _start_cwd / filename
     if not filename.resolve().is_relative_to(_target_dir):
-        return
+        return None
     # f_locals also holds closed-over free variables for a nested function,
     # not just its own parameters, so pull names from getargvalues instead of
     # every key.
@@ -120,26 +132,65 @@ def _trace_calls(frame, event, arg):
         for name in names
         if name in frame.f_locals
     }
-    _calls.append({"qualname": co.co_qualname, "args": args})
+    stack = _call_stack()
+    call_id = next(_call_id_counter)
+    parent_call_id = stack[-1] if stack else None
+    stack.append(call_id)
+    _calls.append(
+        {
+            "call_id": call_id,
+            "parent_call_id": parent_call_id,
+            "qualname": co.co_qualname,
+            "args": args,
+        }
+    )
+    return call_id
+
+
+def _make_local_tracer(call_id, previous_local):
+    # Unlike PR2's chaining (which fully handed the frame's local tracer off
+    # to whatever tool was already active, since _trace_calls only needed
+    # "call"), we now need our own "return" event too, to pop the call
+    # stack. So this stays the local tracer for the frame's whole lifetime,
+    # forwarding every event to the previously-active tracer's own
+    # continuation on top of our own return-driven bookkeeping.
+    state = {"previous_local": previous_local}
+
+    def handler(frame, event, arg):
+        if event == "return" and call_id is not None:
+            stack = _call_stack()
+            if stack and stack[-1] == call_id:
+                stack.pop()
+        if state["previous_local"] is not None:
+            state["previous_local"] = state["previous_local"](frame, event, arg)
+        return handler
+
+    return handler
 
 
 def _dispatch(frame, event, arg):
-    # _trace_calls never wants line/return/exception events for a frame (it
-    # only acts on "call"), so rather than becoming the frame's local
-    # tracer, run it as a side effect and hand off entirely to whatever
-    # tracer (if any) was already active, so tools like coverage or a
-    # debugger keep observing the target exactly as they would have without
-    # us. New threads get _previous_thread_trace instead, since that's what
-    # they'd have inherited had we not overridden threading.settrace().
-    _trace_calls(frame, event, arg)
+    call_id = _trace_calls(frame)
     previous = (
         _previous_trace
         if threading.current_thread() is _start_thread
         else _previous_thread_trace
     )
-    if previous is not None:
-        return previous(frame, event, arg)
-    return None
+    previous_local = previous(frame, event, arg) if previous is not None else None
+    if call_id is None and previous_local is None:
+        # Nothing to do for this frame: we didn't record it (outside
+        # target_dir, or not a real function call), and no other tool wants
+        # to observe it either. Installing a no-op local tracer here would
+        # still cost a "return" callback for every such frame - stdlib-heavy
+        # targets could have a lot of these.
+        return None
+    if previous_local is None:
+        # No other tool is watching this frame, so "line" events (fired per
+        # source line, far more often than call/return) are pure overhead -
+        # we only need call/return. Can't suppress this when a previous
+        # tracer IS chained in, since it might genuinely need line events
+        # (e.g. coverage.py).
+        frame.f_trace_lines = False
+    return _make_local_tracer(call_id, previous_local)
 
 
 def start(target_dir):
@@ -148,11 +199,19 @@ def start(target_dir):
         _start_cwd, \
         _start_thread, \
         _previous_trace, \
-        _previous_thread_trace
+        _previous_thread_trace, \
+        _call_id_counter, \
+        _thread_local
     _target_dir = Path(target_dir).resolve()
     _start_cwd = Path.cwd()
     _start_thread = threading.current_thread()
     _calls.clear()
+    _call_id_counter = itertools.count()
+    # A fresh instance, not .clear() on the shared one, so a worker thread's
+    # leftover stack from a previous start()/stop() cycle in the same
+    # interpreter can't leak into this run (threading.local() only resets
+    # the calling thread's own view, not other threads').
+    _thread_local = threading.local()
     _previous_trace = sys.gettrace()
     _previous_thread_trace = threading.gettrace()
     sys.settrace(_dispatch)

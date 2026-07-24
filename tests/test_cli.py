@@ -5,6 +5,10 @@ import sys
 from ai_tracer import cli
 
 
+def _without_tree_fields(record):
+    return {k: v for k, v in record.items() if k not in ("call_id", "parent_call_id")}
+
+
 def test_cli_prints_usage_and_exits_nonzero_with_no_arguments():
     result = subprocess.run(
         [sys.executable, "-m", "ai_tracer.cli"],
@@ -393,7 +397,7 @@ def test_cli_writes_a_trace_of_the_functions_the_target_calls(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     trace = json.loads((tmp_path / "program.trace.json").read_text())
-    assert trace == [
+    assert [_without_tree_fields(c) for c in trace] == [
         {"qualname": "main", "args": {}},
         {"qualname": "helper", "args": {}},
     ]
@@ -418,7 +422,9 @@ def test_cli_writes_a_trace_even_if_the_target_crashes(tmp_path):
 
     assert result.returncode != 0
     trace = json.loads((tmp_path / "crashy.trace.json").read_text())
-    assert trace == [{"qualname": "doomed", "args": {}}]
+    assert [_without_tree_fields(c) for c in trace] == [
+        {"qualname": "doomed", "args": {}}
+    ]
 
 
 def test_cli_trace_does_not_include_stdlib_calls(tmp_path):
@@ -443,7 +449,9 @@ def test_cli_trace_does_not_include_stdlib_calls(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     trace = json.loads((tmp_path / "program.trace.json").read_text())
-    assert trace == [{"qualname": "main", "args": {}}]
+    assert [_without_tree_fields(c) for c in trace] == [
+        {"qualname": "main", "args": {}}
+    ]
 
 
 def test_cli_trace_survives_the_target_changing_its_own_working_directory(tmp_path):
@@ -481,7 +489,7 @@ def test_cli_trace_survives_the_target_changing_its_own_working_directory(tmp_pa
 
     assert result.returncode == 0, result.stdout + result.stderr
     trace = json.loads((target_dir / "program.trace.json").read_text())
-    assert trace == [
+    assert [_without_tree_fields(c) for c in trace] == [
         {"qualname": "main", "args": {}},
         {"qualname": "after_chdir", "args": {}},
     ]
@@ -510,7 +518,7 @@ def test_cli_trace_includes_the_arguments_a_function_was_called_with(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     trace = json.loads((tmp_path / "program.trace.json").read_text())
-    assert trace == [
+    assert [_without_tree_fields(c) for c in trace] == [
         {"qualname": "main", "args": {}},
         {"qualname": "add", "args": {"a": 1, "b": 2}},
     ]
@@ -541,7 +549,7 @@ def test_cli_trace_stays_valid_json_for_a_nan_argument(tmp_path):
     raw = (tmp_path / "program.trace.json").read_text()
     assert "NaN" not in raw
     trace = json.loads(raw)
-    assert trace == [
+    assert [_without_tree_fields(c) for c in trace] == [
         {"qualname": "main", "args": {}},
         {"qualname": "take", "args": {"value": "nan"}},
     ]
@@ -570,6 +578,36 @@ def test_cli_writes_a_trace_for_an_int_too_large_to_stringify(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     trace = json.loads((tmp_path / "program.trace.json").read_text())
-    assert trace[0] == {"qualname": "main", "args": {}}
+    assert _without_tree_fields(trace[0]) == {"qualname": "main", "args": {}}
     assert trace[1]["qualname"] == "take"
     assert isinstance(trace[1]["args"]["value"], str)
+
+
+def test_cli_trace_includes_the_call_tree(tmp_path):
+    (tmp_path / "program.py").write_text(
+        "def helper():\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    helper()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(tmp_path / "program.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    trace = json.loads((tmp_path / "program.trace.json").read_text())
+    assert trace[0]["qualname"] == "main"
+    assert trace[0]["parent_call_id"] is None
+    assert trace[1]["qualname"] == "helper"
+    assert trace[1]["parent_call_id"] == trace[0]["call_id"]
+    assert trace[0]["call_id"] != trace[1]["call_id"]
