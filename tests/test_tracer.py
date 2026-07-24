@@ -595,6 +595,8 @@ def test_a_top_level_call_has_no_parent():
             "module": "test_tracer",
             "qualname": "sample_function",
             "args": {},
+            "raised": False,
+            "return_value": "done",
         }
     ]
 
@@ -791,3 +793,145 @@ def test_installs_no_local_tracer_for_an_unrecorded_frame_with_nothing_else_watc
     tracer.stop()
 
     assert own_f_trace is None
+
+
+def sample_function_that_returns_a_value():
+    return 42
+
+
+def test_records_the_return_value_of_a_normal_call():
+    tracer.start("tests")
+    sample_function_that_returns_a_value()
+    calls = tracer.stop()
+
+    assert calls[0]["raised"] is False
+    assert calls[0]["return_value"] == 42
+
+
+def sample_function_with_no_return_statement():
+    pass
+
+
+def test_records_an_implicit_none_return_as_not_raised():
+    tracer.start("tests")
+    sample_function_with_no_return_statement()
+    calls = tracer.stop()
+
+    assert calls[0]["raised"] is False
+    assert calls[0]["return_value"] is None
+
+
+def sample_function_that_raises():
+    raise ValueError("boom")
+
+
+def test_records_raised_true_when_an_exception_propagates_uncaught():
+    tracer.start("tests")
+    try:
+        sample_function_that_raises()
+    except ValueError:
+        pass
+    calls = tracer.stop()
+
+    assert calls[0]["raised"] is True
+    assert calls[0]["return_value"] is None
+
+
+def sample_function_that_catches_and_returns():
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        return "caught"
+
+
+def test_records_raised_false_when_a_call_catches_its_own_exception_and_returns_a_value():
+    # "exception" fires for this frame too (it saw the exception even though
+    # it went on to handle it), but an explicit non-None return afterward is
+    # unambiguous proof it didn't propagate - the exception flag alone would
+    # have gotten this wrong.
+    tracer.start("tests")
+    sample_function_that_catches_and_returns()
+    calls = tracer.stop()
+
+    assert calls[0]["raised"] is False
+    assert calls[0]["return_value"] == "caught"
+
+
+def sample_function_that_catches_and_implicitly_returns_none():
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        pass
+
+
+def test_records_raised_true_when_a_call_catches_its_own_exception_and_implicitly_returns_none():
+    # A known, accepted false positive: "return" alone can't tell this
+    # apart from a real propagating exception (both are event="return",
+    # arg=None), and this frame did see an "exception" event. Documented
+    # tradeoff, not a bug - see _make_local_tracer.
+    tracer.start("tests")
+    sample_function_that_catches_and_implicitly_returns_none()
+    calls = tracer.stop()
+
+    assert calls[0]["raised"] is True
+    assert calls[0]["return_value"] is None
+
+
+def sample_inner_that_raises():
+    raise ValueError("inner boom")
+
+
+def sample_outer_that_lets_it_propagate():
+    sample_inner_that_raises()
+
+
+def test_records_raised_true_for_a_frame_that_merely_lets_an_exception_pass_through():
+    tracer.start("tests")
+    try:
+        sample_outer_that_lets_it_propagate()
+    except ValueError:
+        pass
+    calls = tracer.stop()
+
+    assert all(c["raised"] is True for c in calls)
+
+
+_shared_non_serializable_return_value = _NotJSONSerializable()
+
+
+def sample_function_that_returns_a_non_serializable_value():
+    return _shared_non_serializable_return_value
+
+
+def test_falls_back_to_repr_for_a_non_json_serializable_return_value():
+    # return_value goes through the same _snapshot() as args - this just
+    # proves that reuse, not re-deriving the whole args edge-case suite.
+    tracer.start("tests")
+    sample_function_that_returns_a_non_serializable_value()
+    calls = tracer.stop()
+
+    assert calls[0]["raised"] is False
+    assert calls[0]["return_value"] == object.__repr__(
+        _shared_non_serializable_return_value
+    )
+
+
+def test_records_each_generator_resumes_yielded_value_as_its_own_return_value():
+    def sample_generator():
+        yield 1
+        yield 2
+
+    def sample_driver():
+        list(sample_generator())
+
+    tracer.start("tests")
+    sample_driver()
+    calls = tracer.stop()
+
+    generator_calls = [c for c in calls if "sample_generator" in c["qualname"]]
+    # First two resumes: each yield is that resume's own return value. Final
+    # resume: no "exception" event fires for the internal StopIteration used
+    # to signal exhaustion (verified empirically), so it comes out as a
+    # plain, unraised return of None - no special-casing needed for it.
+    assert [c["return_value"] for c in generator_calls] == [1, 2, None]
+    assert all(c["raised"] is False for c in generator_calls)

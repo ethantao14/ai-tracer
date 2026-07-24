@@ -165,10 +165,30 @@ def _make_local_tracer(call_id, previous_local):
     # stack. So this stays the local tracer for the frame's whole lifetime,
     # forwarding every event to the previously-active tracer's own
     # continuation on top of our own return-driven bookkeeping.
-    state = {"previous_local": previous_local}
+    state = {"previous_local": previous_local, "saw_exception": False}
 
     def handler(frame, event, arg):
-        if event == "return" and call_id is not None:
+        if call_id is not None and event == "exception":
+            state["saw_exception"] = True
+        elif call_id is not None and event == "return":
+            # "return" fires for every frame exit, exceptional or not, with
+            # arg set to the actual return value only for a genuine return -
+            # arg is None both for an explicit/implicit `return None` *and*
+            # for an exception unwinding through this frame, and those two
+            # cases are indistinguishable from "return" alone. A non-None
+            # arg is unambiguous (even a frame that caught its own exception
+            # and returned a value lands here), so only fall back to the
+            # exception flag when arg is None. That still misreads "caught
+            # it, then implicitly returned None" as raised - accepted, since
+            # the alternative is silently losing a real propagating
+            # exception, which is worse.
+            record = _calls[call_id]
+            if arg is not None:
+                record["raised"] = False
+                record["return_value"] = _snapshot(arg)
+            else:
+                record["raised"] = state["saw_exception"]
+                record["return_value"] = None
             stack = _call_stack()
             if stack and stack[-1] == call_id:
                 stack.pop()
@@ -196,8 +216,8 @@ def _dispatch(frame, event, arg):
         return None
     if previous_local is None:
         # No other tool is watching this frame, so "line" events (fired per
-        # source line, far more often than call/return) are pure overhead -
-        # we only need call/return. Can't suppress this when a previous
+        # source line, far more often than call/return/exception) are pure
+        # overhead - we don't need them. Can't suppress this when a previous
         # tracer IS chained in, since it might genuinely need line events
         # (e.g. coverage.py).
         frame.f_trace_lines = False
