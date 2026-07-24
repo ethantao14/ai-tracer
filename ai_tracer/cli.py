@@ -17,36 +17,28 @@ def _local_module_names(target_dir):
 
 
 def run(target_path, program_args=(), restore=True, trace_output=None):
-    # restore=False for the CLI: atexit handlers run after this returns but
-    # before the process exits, and need the target's state, not ours.
+    # restore=False for the CLI: atexit handlers need the target's state, not ours.
     resolved_path = Path(target_path).resolve()
     target_dir = str(resolved_path.parent)
     if trace_output is None:
         trace_output = resolved_path.with_suffix(".trace.json")
 
-    # `python -m` puts the launch cwd at sys.path[0]; `python target.py`
-    # puts the target's own directory there. Overwrite, don't insert.
+    # `python -m` puts the launch cwd at sys.path[0]; `python target.py` uses the target's.
     original_sys_path = list(sys.path)
     sys.path[0] = target_dir
-    # Snapshot before eviction so both it and the target's own imports can
-    # be undone, run() may be called more than once per interpreter.
+    # Snapshot before eviction so run() can undo it on a later call too.
     original_sys_modules = dict(sys.modules)
-    # Our own imports already populate sys.modules, unlike a fresh
-    # `python target.py` process. Evict local names so they can shadow.
+    # Evict local names so a target sibling module can shadow one we already imported.
     for name in _local_module_names(target_dir):
         sys.modules.pop(name, None)
-    # runpy.run_path only replaces argv[0] with the path it's given, so
-    # pass the original (possibly relative) string, and set the rest
-    # ourselves.
+    # run_path only replaces argv[0]; pass the original string and set the rest ourselves.
     original_argv = sys.argv
     sys.argv = [str(target_path), *program_args]
     tracer.start(target_dir)
     try:
         runpy.run_path(str(target_path), run_name="__main__")
     finally:
-        # Write the trace even if the target crashed, an uncaught exception
-        # is exactly what should be recorded, not lost. Restoration below
-        # must still happen even if the write itself fails.
+        # Write the trace even on a crash; restoration must still happen if the write fails.
         calls = tracer.stop()
         try:
             Path(trace_output).write_text(json.dumps(calls, indent=2))
@@ -59,9 +51,7 @@ def run(target_path, program_args=(), restore=True, trace_output=None):
 
 
 def main():
-    # Not argparse: REMAINDER swallows a leading "--" right after the
-    # program path, unlike real `python app.py -- --flag`. A plain slice
-    # forwards everything after the program path verbatim.
+    # Not argparse: REMAINDER swallows a leading "--", a plain slice doesn't.
     argv = sys.argv[1:]
     if not argv:
         print("usage: ai-tracer <program> [program_args...]", file=sys.stderr)
