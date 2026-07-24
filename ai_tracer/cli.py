@@ -14,41 +14,25 @@ def _local_module_names(target_dir):
 
 
 def run(target_path, program_args=(), restore=True):
-    # restore=False for the CLI entry point below: an atexit handler the
-    # target registers runs after this function returns, but before the
-    # process actually exits, restoring state immediately would make that
-    # handler see ai-tracer's own argv/path/modules instead of the
-    # target's, unlike direct execution, where nothing is ever restored,
-    # the process just exits with the target's state intact. Library-style
-    # callers that keep running afterward (our own tests, future in-process
-    # use) need restore=True, the default, so nothing leaks to what runs
-    # next in the same process.
+    # restore=False for the CLI: atexit handlers run after this returns but
+    # before the process exits, and need the target's state, not ours.
     resolved_path = Path(target_path).resolve()
     target_dir = str(resolved_path.parent)
 
     # `python -m` puts the launch cwd at sys.path[0]; `python target.py`
-    # puts the target's own directory there instead. Overwrite index 0
-    # rather than insert, so sibling imports work and the launch directory
-    # doesn't leak in as an accidental import source.
+    # puts the target's own directory there. Overwrite, don't insert.
     original_sys_path = list(sys.path)
     sys.path[0] = target_dir
-    # Snapshotted before any sys.modules changes below, so it can undo both
-    # the eviction and whatever the target itself imports, run() can be
-    # called more than once in the same interpreter (our own tests do
-    # this), nothing should leak between calls, matching separate
-    # `python target.py` processes.
+    # Snapshot before eviction so both it and the target's own imports can
+    # be undone, run() may be called more than once per interpreter.
     original_sys_modules = dict(sys.modules)
-    # Our own imports (e.g. pathlib above) already populate sys.modules,
-    # unlike a fresh `python target.py` process. Evict anything the target
-    # directory defines itself so a same-named local file can shadow it.
+    # Our own imports already populate sys.modules, unlike a fresh
+    # `python target.py` process. Evict local names so they can shadow.
     for name in _local_module_names(target_dir):
         sys.modules.pop(name, None)
-    # runpy.run_path only replaces argv[0], everything else needs to be set
-    # explicitly: our own argv shouldn't leak into the target, and target
-    # args need to actually reach it. runpy.run_path also resets argv[0]
-    # itself to whatever path it's given, so that has to be the original
-    # (possibly relative) string too, matching what `python app.py` leaves
-    # in sys.argv[0].
+    # runpy.run_path only replaces argv[0] with the path it's given, so
+    # pass the original (possibly relative) string, and set the rest
+    # ourselves.
     original_argv = sys.argv
     sys.argv = [str(target_path), *program_args]
     try:
