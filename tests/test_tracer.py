@@ -1,6 +1,7 @@
 import math
 import sys
 import threading
+import time
 
 from ai_tracer import tracer
 
@@ -721,6 +722,52 @@ def test_worker_thread_calls_get_their_own_independent_tree():
     # thread - cross-thread attribution is deliberately out of scope.
     assert caller_call["parent_call_id"] is None
     assert nested_call["parent_call_id"] == caller_call["call_id"]
+
+
+def sample_function_that_echoes(value):
+    return value
+
+
+def test_return_values_are_attributed_correctly_under_thread_interleaving():
+    # A call_id is assigned (via the thread-safe counter) before its record
+    # is appended to _calls, so two threads can both obtain a call_id before
+    # either appends - call_id is not reliably that record's index into the
+    # shared list once threads race. Forces exactly that interleaving: both
+    # threads' module-name snapshot (the same value, "test_tracer", for
+    # both) rendezvous on a barrier, then thread A sleeps a little longer
+    # before its own record actually gets appended, so thread B's record
+    # lands at a lower list index than thread A's despite thread A having
+    # called _trace_calls (and obtained its call_id) first.
+    barrier = threading.Barrier(2)
+    original_snapshot = tracer._snapshot
+
+    def rendezvousing_snapshot(value):
+        if value == "test_tracer":
+            barrier.wait(timeout=2)
+            if threading.current_thread().name == "A":
+                time.sleep(0.05)
+        return original_snapshot(value)
+
+    tracer._snapshot = rendezvousing_snapshot
+    try:
+        tracer.start("tests")
+        thread_a = threading.Thread(
+            target=sample_function_that_echoes, args=("A",), name="A"
+        )
+        thread_b = threading.Thread(
+            target=sample_function_that_echoes, args=("B",), name="B"
+        )
+        thread_a.start()
+        thread_b.start()
+        thread_a.join()
+        thread_b.join()
+        calls = tracer.stop()
+    finally:
+        tracer._snapshot = original_snapshot
+
+    assert len(calls) == 2
+    for call in calls:
+        assert call["return_value"] == call["args"]["value"]
 
 
 def test_generator_resumes_are_recorded_as_separate_sibling_calls():
