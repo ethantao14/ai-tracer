@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 
@@ -350,3 +351,76 @@ def test_run_restores_sys_path_and_argv_even_if_the_target_crashes(tmp_path):
 
     assert sys.path == original_path
     assert sys.argv == original_argv
+
+
+def test_cli_writes_a_trace_of_the_functions_the_target_calls(tmp_path):
+    (tmp_path / "program.py").write_text(
+        "def helper():\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    helper()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(tmp_path / "program.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    trace = json.loads((tmp_path / "program.trace.json").read_text())
+    assert trace == [{"qualname": "main"}, {"qualname": "helper"}]
+
+
+def test_cli_writes_a_trace_even_if_the_target_crashes(tmp_path):
+    (tmp_path / "crashy.py").write_text(
+        "def doomed():\n"
+        '    raise RuntimeError("boom")\n'
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    doomed()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(tmp_path / "crashy.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    trace = json.loads((tmp_path / "crashy.trace.json").read_text())
+    assert trace == [{"qualname": "doomed"}]
+
+
+def test_cli_trace_does_not_include_stdlib_calls(tmp_path):
+    (tmp_path / "program.py").write_text(
+        "import json\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    json.dumps({})\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(tmp_path / "program.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    trace = json.loads((tmp_path / "program.trace.json").read_text())
+    assert trace == [{"qualname": "main"}]

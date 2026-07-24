@@ -1,6 +1,9 @@
+import json
 import runpy
 import sys
 from pathlib import Path
+
+from ai_tracer import tracer
 
 
 def _local_module_names(target_dir):
@@ -13,11 +16,13 @@ def _local_module_names(target_dir):
     return names
 
 
-def run(target_path, program_args=(), restore=True):
+def run(target_path, program_args=(), restore=True, trace_output=None):
     # restore=False for the CLI: atexit handlers run after this returns but
     # before the process exits, and need the target's state, not ours.
     resolved_path = Path(target_path).resolve()
     target_dir = str(resolved_path.parent)
+    if trace_output is None:
+        trace_output = resolved_path.with_suffix(".trace.json")
 
     # `python -m` puts the launch cwd at sys.path[0]; `python target.py`
     # puts the target's own directory there. Overwrite, don't insert.
@@ -35,9 +40,14 @@ def run(target_path, program_args=(), restore=True):
     # ourselves.
     original_argv = sys.argv
     sys.argv = [str(target_path), *program_args]
+    tracer.start(target_dir)
     try:
         runpy.run_path(str(target_path), run_name="__main__")
     finally:
+        # Write the trace even if the target crashed, an uncaught exception
+        # is exactly what should be recorded, not lost.
+        calls = tracer.stop()
+        Path(trace_output).write_text(json.dumps(calls, indent=2))
         if restore:
             sys.argv = original_argv
             sys.path[:] = original_sys_path

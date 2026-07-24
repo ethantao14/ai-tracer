@@ -1,0 +1,98 @@
+import sys
+
+from ai_tracer import tracer
+
+
+def sample_function():
+    return "done"
+
+
+def test_start_stop_records_a_simple_call():
+    tracer.start("tests")
+    sample_function()
+    calls = tracer.stop()
+
+    assert calls == [{"qualname": "sample_function"}]
+
+
+def test_ignores_calls_outside_target_dir(tmp_path):
+    tracer.start(str(tmp_path))
+    sample_function()
+    calls = tracer.stop()
+
+    assert calls == []
+
+
+def sample_caller():
+    return sample_function()
+
+
+def test_records_nested_calls_in_call_order():
+    tracer.start("tests")
+    sample_caller()
+    calls = tracer.stop()
+
+    assert calls == [
+        {"qualname": "sample_caller"},
+        {"qualname": "sample_function"},
+    ]
+
+
+def sample_recursive(n):
+    if n == 0:
+        return 0
+    return sample_recursive(n - 1)
+
+
+def test_records_each_recursive_call_separately():
+    tracer.start("tests")
+    sample_recursive(2)
+    calls = tracer.stop()
+
+    assert calls == [{"qualname": "sample_recursive"}] * 3
+
+
+def test_does_not_record_class_body_execution():
+    # A class statement is unrelated to any prior "call" filtering; run it
+    # only after start() so its body executes while tracing is active.
+    tracer.start("tests")
+
+    class SampleClass:
+        CLASS_LEVEL = sample_function()
+
+        def method(self):
+            return "called"
+
+    SampleClass().method()
+    calls = tracer.stop()
+
+    assert calls == [
+        {"qualname": "sample_function"},
+        {
+            "qualname": "test_does_not_record_class_body_execution.<locals>.SampleClass.method"
+        },
+    ]
+
+
+def test_stop_restores_a_previously_active_tracer():
+    def other_tracer(frame, event, arg):
+        return other_tracer
+
+    sys.settrace(other_tracer)
+    try:
+        tracer.start("tests")
+        sample_function()
+        tracer.stop()
+
+        assert sys.gettrace() is other_tracer
+    finally:
+        sys.settrace(None)
+
+
+def test_stop_restores_no_tracer_when_none_was_active():
+    sys.settrace(None)
+    tracer.start("tests")
+    sample_function()
+    tracer.stop()
+
+    assert sys.gettrace() is None
