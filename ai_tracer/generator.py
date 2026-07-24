@@ -154,8 +154,12 @@ def generate(trace_log_path, target_dir, output_dir="generated_tests"):
     if _would_clobber(conftest_path):
         print(
             f"Not writing {conftest_path}: a conftest.py that ai-tracer didn't "
-            "generate is already there; generated tests fall back to their own "
-            "sys.path setup",
+            "generate is already there. The generated tests still import the "
+            "target via their own sys.path setup, but the one-time eviction of "
+            "stale/shadowing same-named modules is skipped, so if this pytest "
+            "session already cached a module sharing a top-level name with the "
+            "target, imports could resolve to it. Use an empty output directory "
+            "(the default generated_tests/) to get the full setup.",
             file=sys.stderr,
         )
     else:
@@ -214,6 +218,14 @@ def _skip_reason(call, module_cache, signature_cache):
         _is_valid_import_name(part) for part in call["module"].split(".")
     ):
         return f"module {call['module']!r} is not a valid import target"
+    # A call still in progress when tracing stopped (a worker thread the main
+    # script never joined) is written by tracer.stop() before its return event
+    # fires, so it has no raised/return_* fields. It never produced an outcome
+    # to assert - skip it rather than crash on the missing keys below.
+    if "raised" not in call:
+        return (
+            "call didn't finish before tracing stopped (e.g. an unjoined worker thread)"
+        )
     # Non-JSON (repr-fallback) values are never reconstructable as a
     # literal, don't generate a test that's likely to be wrong.
     if any(kind != "json" for kind in call["arg_serialization"].values()):

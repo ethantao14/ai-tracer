@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 
@@ -756,6 +757,52 @@ def test_conftest_evicts_cached_target_modules_once_for_the_session(tmp_path):
     assert "_name.split('.')[0] in _local" in conftest
     # Test files no longer do their own eviction; they just import.
     assert "_local" not in (output_dir / "test_helper.py").read_text()
+
+
+def test_skips_an_unfinished_call_record_without_crashing(tmp_path):
+    # A worker thread still running when the main script returns leaves its
+    # call in progress; tracer.stop() writes that record before its return
+    # event, so it has no raised/return_* fields. The generator must skip it
+    # with a reason, not crash on the missing keys. Built as a literal trace
+    # (rather than racing a real thread) to stay deterministic.
+    (tmp_path / "helper.py").write_text("def worker():\n    return 1\n")
+    trace = [
+        {
+            "call_id": 0,
+            "parent_call_id": None,
+            "module": "helper",
+            "qualname": "worker",
+            "args": {},
+            "arg_serialization": {},
+        }
+    ]
+    trace_path = tmp_path / "program.trace.json"
+    trace_path.write_text(json.dumps(trace))
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    assert written == []
+
+
+def test_skips_an_unfinished_call_with_a_clear_reason(tmp_path, capsys):
+    (tmp_path / "helper.py").write_text("def worker():\n    return 1\n")
+    trace = [
+        {
+            "call_id": 0,
+            "parent_call_id": None,
+            "module": "helper",
+            "qualname": "worker",
+            "args": {},
+            "arg_serialization": {},
+        }
+    ]
+    trace_path = tmp_path / "program.trace.json"
+    trace_path.write_text(json.dumps(trace))
+
+    generator.generate(str(trace_path), str(tmp_path), str(tmp_path / "out"))
+
+    assert "didn't finish before tracing stopped" in capsys.readouterr().err
 
 
 def test_a_target_conftest_is_not_in_the_eviction_set(tmp_path):

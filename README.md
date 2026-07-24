@@ -75,7 +75,9 @@ def test_double_0():
     assert result == 42
 ```
 
-It also writes a `conftest.py` next to them. That file runs once when pytest starts and clears any target module cached under the same name (a target module shadowing another, or a stale entry from a previous run) so every generated test imports the target's own code. Doing this once, rather than in each test file, keeps a module or package that other target modules import at load time from being re-executed per file. If a `conftest.py` ai-tracer didn't generate already exists in the output directory, it's left untouched (each test file still sets up `sys.path` itself, so imports resolve regardless). Run the generated tests as their own pytest invocation, e.g. `pytest generated_tests/`.
+It also writes a `conftest.py` next to them. That file runs once when pytest starts and clears any target module cached under the same name (a target module shadowing another, or a stale entry from a previous run) so every generated test imports the target's own code. Doing this once, rather than in each test file, keeps a module or package that other target modules import at load time from being re-executed per file. Run the generated tests as their own pytest invocation, e.g. `pytest generated_tests/`.
+
+If a `conftest.py` ai-tracer didn't generate already exists in the output directory, it's left untouched: the generated tests still import the target through their own `sys.path` setup, but the one-time module eviction is skipped (a warning is printed), so a same-named module already cached in that pytest session could shadow the target's. Point the output at an empty directory (the default `generated_tests/`) to get the full setup.
 
 Not every recorded call becomes a test. A call is skipped, with a one-line reason printed to stderr (so it's never a silent no-op), when it can't be reconstructed safely as a standalone test:
 
