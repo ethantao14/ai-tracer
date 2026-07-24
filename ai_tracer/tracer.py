@@ -1,9 +1,11 @@
 import inspect
+import math
 import sys
 import threading
 from pathlib import Path
 
 _SYNTHETIC_FRAME_NAMES = {"<listcomp>", "<dictcomp>", "<setcomp>", "<genexpr>"}
+_JSON_SAFE_SCALAR_TYPES = (str, bool, type(None))
 
 _target_dir = None
 _start_cwd = None
@@ -11,6 +13,69 @@ _start_thread = None
 _calls = []
 _previous_trace = None
 _previous_thread_trace = None
+
+
+def _to_json_safe(value):
+    # Dispatch on the value's *exact* type, never a subclass: iterating a
+    # plain list/dict can't run user code, but a subclass could override
+    # __iter__/keys()/etc. with side effects, and json.dumps would call
+    # straight into those while we're just trying to observe the argument.
+    # These raises never interpolate the value or its type name: an f-string
+    # `!r` calls repr(), and even `value_type.__name__` can run target code
+    # for a custom metaclass overriding __getattribute__ - and every one of
+    # these messages is immediately caught and discarded by _snapshot below.
+    value_type = type(value)
+    if value_type is float:
+        if not math.isfinite(value):
+            # json.dumps emits bare NaN/Infinity, which isn't valid JSON and
+            # would corrupt the .trace.json file it ends up written into.
+            raise ValueError("non-finite float")
+        return value
+    if value_type is int:
+        try:
+            str(value)
+        except ValueError:
+            # An int past sys.get_int_max_str_digits() (default 4300
+            # digits) can't be converted to a string at all - the same
+            # limit json.dumps would hit later when writing the trace file,
+            # which by then is too late to recover from gracefully.
+            raise ValueError(
+                "integer exceeds the interpreter's max str digits"
+            ) from None
+        return value
+    # `in` on a tuple compares with ==, which for a class object with a
+    # custom metaclass __eq__ would call that target-defined method (and
+    # could even lie and return True, letting the object itself through
+    # unvalidated). `is` never invokes anything overridable.
+    if any(value_type is safe_type for safe_type in _JSON_SAFE_SCALAR_TYPES):
+        return value
+    if value_type is list or value_type is tuple:
+        return [_to_json_safe(item) for item in value]
+    if value_type is dict:
+        result = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError("non-string dict key")
+            result[key] = _to_json_safe(item)
+        return result
+    raise TypeError("not a JSON-safe value")
+
+
+def _snapshot(value):
+    # Freezes the value as of this exact moment (later mutation by the
+    # traced code can't change what we recorded).
+    try:
+        return _to_json_safe(value)
+    except Exception:  # noqa: BLE001 - any snapshot failure must not abort the target
+        if type(value) is float:
+            # A float has no nested content, so its own repr (e.g. for NaN
+            # or infinity) can't reach any target-defined code.
+            return repr(value)
+        # Anything else (a container that failed deeper in, or a
+        # target-defined class) could have a __repr__ - its own or a nested
+        # element's - that runs arbitrary code with side effects. Bypass
+        # every override via the base implementation instead of repr(value).
+        return object.__repr__(value)
 
 
 def _trace_calls(frame, event, arg):
@@ -37,7 +102,25 @@ def _trace_calls(frame, event, arg):
         filename = _start_cwd / filename
     if not filename.resolve().is_relative_to(_target_dir):
         return
-    _calls.append({"qualname": co.co_qualname})
+    # f_locals also holds closed-over free variables for a nested function,
+    # not just its own parameters, so pull names from getargvalues instead of
+    # every key.
+    arg_info = inspect.getargvalues(frame)
+    names = [*arg_info.args]
+    if arg_info.varargs:
+        names.append(arg_info.varargs)
+    if arg_info.keywords:
+        names.append(arg_info.keywords)
+    # Python fires another "call" event each time a generator/coroutine
+    # frame is resumed, not just when it's first entered. If the function
+    # already `del`eted one of its own parameters before yielding, that name
+    # is gone from f_locals on the next resume.
+    args = {
+        name: _snapshot(frame.f_locals[name])
+        for name in names
+        if name in frame.f_locals
+    }
+    _calls.append({"qualname": co.co_qualname, "args": args})
 
 
 def _dispatch(frame, event, arg):
