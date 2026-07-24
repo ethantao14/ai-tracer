@@ -356,6 +356,29 @@ def test_falls_back_to_repr_for_nan_and_infinity():
     ]
 
 
+def sample_function_with_a_huge_int_arg(value):
+    return value
+
+
+def test_falls_back_to_a_safe_placeholder_for_an_int_too_large_to_stringify():
+    # Past sys.get_int_max_str_digits() (default 4300 digits), even str()
+    # and repr() raise ValueError - the same limit json.dumps hits, which
+    # is exactly why this can't be left for the final write in cli.py to
+    # discover.
+    huge = 10**5000
+
+    tracer.start("tests")
+    sample_function_with_a_huge_int_arg(huge)
+    calls = tracer.stop()
+
+    assert calls == [
+        {
+            "qualname": "sample_function_with_a_huge_int_arg",
+            "args": {"value": object.__repr__(huge)},
+        }
+    ]
+
+
 class _RaisesOnRepr:
     def __repr__(self):
         raise RuntimeError("broken repr")

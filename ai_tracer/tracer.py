@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 
 _SYNTHETIC_FRAME_NAMES = {"<listcomp>", "<dictcomp>", "<setcomp>", "<genexpr>"}
-_JSON_SAFE_SCALAR_TYPES = (str, int, bool, type(None))
+_JSON_SAFE_SCALAR_TYPES = (str, bool, type(None))
 
 _target_dir = None
 _start_cwd = None
@@ -30,6 +30,18 @@ def _to_json_safe(value):
             # json.dumps emits bare NaN/Infinity, which isn't valid JSON and
             # would corrupt the .trace.json file it ends up written into.
             raise ValueError("non-finite float")
+        return value
+    if value_type is int:
+        try:
+            str(value)
+        except ValueError:
+            # An int past sys.get_int_max_str_digits() (default 4300
+            # digits) can't be converted to a string at all - the same
+            # limit json.dumps would hit later when writing the trace file,
+            # which by then is too late to recover from gracefully.
+            raise ValueError(
+                "integer exceeds the interpreter's max str digits"
+            ) from None
         return value
     if value_type in _JSON_SAFE_SCALAR_TYPES:
         return value

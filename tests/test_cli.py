@@ -545,3 +545,31 @@ def test_cli_trace_stays_valid_json_for_a_nan_argument(tmp_path):
         {"qualname": "main", "args": {}},
         {"qualname": "take", "args": {"value": "nan"}},
     ]
+
+
+def test_cli_writes_a_trace_for_an_int_too_large_to_stringify(tmp_path):
+    (tmp_path / "program.py").write_text(
+        "def take(value):\n"
+        "    return value\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    take(10**5000)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(tmp_path / "program.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    trace = json.loads((tmp_path / "program.trace.json").read_text())
+    assert trace[0] == {"qualname": "main", "args": {}}
+    assert trace[1]["qualname"] == "take"
+    assert isinstance(trace[1]["args"]["value"], str)
