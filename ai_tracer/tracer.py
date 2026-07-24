@@ -183,8 +183,8 @@ def _make_local_tracer(record, previous_local):
             # arg is unambiguous (even a frame that caught its own exception
             # and returned a value lands here), so only fall back to the
             # exception flag when arg is None. That still misreads "caught
-            # it, then implicitly returned None" as raised - accepted, since
-            # the alternative is silently losing a real propagating
+            # it, then returned None" (explicitly or implicitly) as raised -
+            # accepted, since the alternative is silently losing a real propagating
             # exception, which is worse.
             if arg is not None:
                 record["raised"] = False
