@@ -77,19 +77,23 @@ def _to_json_safe(value):
 
 def _snapshot(value):
     # Freezes the value as of this exact moment (later mutation by the
-    # traced code can't change what we recorded).
+    # traced code can't change what we recorded). The "kind" tag travels
+    # alongside the value so a consumer (e.g. a future test generator) can
+    # tell a real JSON value apart from a repr() fallback string - without
+    # it, {"obj": "<Thing object at 0x...>"} is indistinguishable from a
+    # call that genuinely passed that exact string.
     try:
-        return _to_json_safe(value)
+        return _to_json_safe(value), "json"
     except Exception:  # noqa: BLE001 - any snapshot failure must not abort the target
         if type(value) is float:
             # A float has no nested content, so its own repr (e.g. for NaN
             # or infinity) can't reach any target-defined code.
-            return repr(value)
+            return repr(value), "repr"
         # Anything else (a container that failed deeper in, or a
         # target-defined class) could have a __repr__ - its own or a nested
         # element's - that runs arbitrary code with side effects. Bypass
         # every override via the base implementation instead of repr(value).
-        return object.__repr__(value)
+        return object.__repr__(value), "repr"
 
 
 def _trace_calls(frame):
@@ -127,11 +131,12 @@ def _trace_calls(frame):
     # frame is resumed, not just when it's first entered. If the function
     # already `del`eted one of its own parameters before yielding, that name
     # is gone from f_locals on the next resume.
-    args = {
-        name: _snapshot(frame.f_locals[name])
-        for name in names
-        if name in frame.f_locals
-    }
+    args = {}
+    arg_serialization = {}
+    for name in names:
+        if name not in frame.f_locals:
+            continue
+        args[name], arg_serialization[name] = _snapshot(frame.f_locals[name])
     stack = _call_stack()
     call_id = next(_call_id_counter)
     parent_call_id = stack[-1] if stack else None
@@ -145,13 +150,14 @@ def _trace_calls(frame):
     # Snapshotted like any other target-controlled value: a target that
     # rebinds its own __name__ to something non-JSON-safe must not be able
     # to break the eventual json.dumps() of the whole trace.
-    module = _snapshot(frame.f_globals.get("__name__"))
+    module, _ = _snapshot(frame.f_globals.get("__name__"))
     record = {
         "call_id": call_id,
         "parent_call_id": parent_call_id,
         "module": module,
         "qualname": co.co_qualname,
         "args": args,
+        "arg_serialization": arg_serialization,
     }
     _calls.append(record)
     return record
@@ -188,10 +194,11 @@ def _make_local_tracer(record, previous_local):
             # exception, which is worse.
             if arg is not None:
                 record["raised"] = False
-                record["return_value"] = _snapshot(arg)
+                record["return_value"], record["return_serialization"] = _snapshot(arg)
             else:
                 record["raised"] = state["saw_exception"]
                 record["return_value"] = None
+                record["return_serialization"] = None
             stack = _call_stack()
             if stack and stack[-1] == record["call_id"]:
                 stack.pop()

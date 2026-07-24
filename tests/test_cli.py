@@ -606,8 +606,10 @@ def test_cli_trace_records_main_for_the_entry_script(tmp_path):
             "module": "__main__",
             "qualname": "main",
             "args": {},
+            "arg_serialization": {},
             "raised": False,
             "return_value": 1,
+            "return_serialization": "json",
         }
     ]
 
