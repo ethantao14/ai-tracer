@@ -221,6 +221,117 @@ def test_skips_a_call_whose_module_fails_to_import(tmp_path, capsys):
     assert "could not be imported" in capsys.readouterr().err
 
 
+def test_generates_a_passing_test_for_a_function_that_returns_none(tmp_path):
+    # A function with no explicit return records raised=false,
+    # return_value=null, return_serialization=null. That's a genuine None
+    # return (a safe literal), not an uncapturable value - it must still
+    # generate a test that passes.
+    (tmp_path / "helper.py").write_text("def note(x):\n    pass\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import note\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    note(1)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    assert written == [output_dir / "test_helper.py"]
+    assert "assert result == None" in (output_dir / "test_helper.py").read_text()
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_skips_a_call_whose_args_no_longer_bind_to_the_current_signature(
+    tmp_path, capsys
+):
+    # Traced as double(x=...), but the parameter was renamed to y since -
+    # emitting double(x=...) would produce a test that fails the instant it
+    # calls the function, so skip it instead.
+    (tmp_path / "helper.py").write_text("def double(x):\n    return x * 2\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import double\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    double(21)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+    # A clearly different length from the traced version, so Python can't
+    # reuse a same-second, same-size stale .pyc instead of the new source.
+    (tmp_path / "helper.py").write_text(
+        "def double(renamed_parameter):\n    return renamed_parameter * 2\n"
+    )
+
+    written = generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert written == []
+    assert "no longer match the function's signature" in capsys.readouterr().err
+
+
+def test_a_target_sibling_shadowing_a_cached_module_wins(tmp_path):
+    # helper imports a sibling named "config". A module of the same name is
+    # already cached in sys.modules (simulating a stdlib/dependency name, or
+    # a leftover from a previous generate() call). The target's own sibling
+    # must win, or importing helper for signature inspection sees the wrong
+    # config and can wrongly skip a call that traced fine.
+    (tmp_path / "config.py").write_text("VALUE = 'target'\n")
+    (tmp_path / "helper.py").write_text(
+        "from config import VALUE\n\n\ndef describe(x):\n    return VALUE\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import describe\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    describe(1)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    import types
+
+    stale = types.ModuleType("config")
+    stale.VALUE = "stale"
+    sys.modules["config"] = stale
+    output_dir = tmp_path / "generated_tests"
+    try:
+        written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+        # Capture what generate() left behind before this test cleans it up.
+        restored = sys.modules.get("config")
+    finally:
+        sys.modules.pop("config", None)
+
+    # The call generated (rather than being skipped, which is what a stale
+    # config would have caused), and the pre-existing module was restored
+    # afterward rather than left evicted.
+    assert written == [output_dir / "test_helper.py"]
+    assert restored is stale
+
+
 def test_generates_one_test_per_call_with_an_index_suffix(tmp_path):
     (tmp_path / "helper.py").write_text("def double(x):\n    return x * 2\n")
     trace_path = _trace(

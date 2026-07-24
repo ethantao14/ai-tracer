@@ -20,6 +20,16 @@ def _is_valid_import_name(part):
     return part.isidentifier() and not keyword.iskeyword(part)
 
 
+def _local_module_names(target_dir):
+    names = set()
+    for entry in Path(target_dir).iterdir():
+        if entry.is_file() and entry.suffix == ".py":
+            names.add(entry.stem)
+        elif entry.is_dir() and (entry / "__init__.py").is_file():
+            names.add(entry.name)
+    return names
+
+
 def generate(trace_log_path, target_dir, output_dir="generated_tests"):
     calls = json.loads(Path(trace_log_path).read_text())
     target_dir = str(Path(target_dir).resolve())
@@ -29,6 +39,16 @@ def generate(trace_log_path, target_dir, output_dir="generated_tests"):
     signature_cache = {}
 
     sys.path.insert(0, target_dir)
+    # Snapshot sys.modules so anything imported while inspecting target code
+    # (the target modules themselves and whatever they import) is undone
+    # afterward, keeping repeated generate() calls in one process hermetic.
+    original_sys_modules = dict(sys.modules)
+    # Evict every name the target dir defines, not just the module under
+    # test, so a target sibling (e.g. a local inspect.py, or a module cached
+    # from a previous generate() call) wins over a stale/stdlib module of the
+    # same name - matching how the CLI runs the target in the first place.
+    for name in _local_module_names(target_dir):
+        sys.modules.pop(name, None)
     try:
         for call in calls:
             reason = _skip_reason(call, module_cache, signature_cache)
@@ -41,6 +61,8 @@ def generate(trace_log_path, target_dir, output_dir="generated_tests"):
                 )
     finally:
         sys.path.remove(target_dir)
+        sys.modules.clear()
+        sys.modules.update(original_sys_modules)
 
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True, parents=True)
@@ -84,7 +106,11 @@ def _skip_reason(call, module_cache, signature_cache):
         return "one or more arguments could not be captured as a JSON value"
     if call["raised"]:
         return "call raised an exception, not supported yet"
-    if call["return_serialization"] != "json":
+    # raised is False here, so return_serialization is "json" (a real JSON
+    # value), "repr" (a non-serializable value we can't reconstruct as a
+    # literal), or None (a genuine None return, which json.dumps handles as
+    # `null` and is a perfectly safe literal). Only "repr" is unusable.
+    if call["return_serialization"] == "repr":
         return "return value could not be captured as a JSON value"
     # Importing re-executes the module's top-level code, which can raise
     # anything, including whatever originally crashed the target program
@@ -95,25 +121,33 @@ def _skip_reason(call, module_cache, signature_cache):
         return (
             f"module {call['module']!r} could not be imported (it may raise on import)"
         )
-    if not _has_supported_signature(
+    signature = _get_signature(
         call["module"], call["qualname"], module_cache, signature_cache
-    ):
+    )
+    if signature is None:
         return (
             "function no longer exists, or has an unsupported signature "
             "(positional-only, *args, or **kwargs)"
         )
+    # Even a supported signature may no longer accept the recorded argument
+    # names (the function was renamed, its parameters changed, a new required
+    # one was added). Binding the recorded names against the current
+    # signature catches that here, instead of emitting a test that fails the
+    # moment it calls the function.
+    try:
+        signature.bind(**dict.fromkeys(call["args"]))
+    except TypeError:
+        return "recorded arguments no longer match the function's signature"
     return None
 
 
 def _fresh_import(module_name):
-    # Force a fresh import rather than reusing whatever sys.modules happens
-    # to have cached - generate() can be called more than once in the same
-    # process (as our own tests do), each time potentially pointing at a
-    # different target_dir with an unrelated module that happens to share a
-    # name. Popping only the leaf module isn't enough for a dotted name
-    # ("pkg.calc"): if the parent package ("pkg") is still cached, its
-    # __path__ still points at the *previous* target_dir, so re-importing
-    # the submodule would find the stale file through the stale parent.
+    # generate() already evicts the target dir's own top-level names before
+    # the run, but a dotted name ("pkg.calc") also needs every prefix popped:
+    # if the parent package ("pkg") got re-cached as a side effect of an
+    # earlier import in this same run, its __path__ could still point at a
+    # stale location, so re-importing the submodule would find the wrong file
+    # through the stale parent.
     parts = module_name.split(".")
     for i in range(len(parts)):
         sys.modules.pop(".".join(parts[: i + 1]), None)
@@ -133,22 +167,27 @@ def _get_module(module_name, module_cache):
     return module_cache[module_name]
 
 
-def _has_supported_signature(module_name, qualname, module_cache, signature_cache):
+def _get_signature(module_name, qualname, module_cache, signature_cache):
+    # Returns the current inspect.Signature for a generatable function, or
+    # None if it no longer exists, can't be introspected, or uses a
+    # parameter kind we can't replay with plain keyword arguments
+    # (positional-only, *args, **kwargs). Cached by (module, qualname) - the
+    # signature is a property of the function, independent of any one call's
+    # arguments, so the per-call argument binding is checked separately.
     key = (module_name, qualname)
     if key not in signature_cache:
         module = _get_module(module_name, module_cache)
         try:
             function = getattr(module, qualname)
-            parameters = inspect.signature(function).parameters.values()
+            signature = inspect.signature(function)
         except (AttributeError, TypeError, ValueError):
-            # The trace log can reference a function that no longer exists
-            # or can't be introspected (e.g. removed or renamed since it
-            # was traced) - skip it rather than crash the whole run.
-            signature_cache[key] = False
+            signature_cache[key] = None
         else:
-            signature_cache[key] = not any(
-                p.kind in _UNSUPPORTED_PARAM_KINDS for p in parameters
+            has_unsupported_kind = any(
+                p.kind in _UNSUPPORTED_PARAM_KINDS
+                for p in signature.parameters.values()
             )
+            signature_cache[key] = None if has_unsupported_kind else signature
     return signature_cache[key]
 
 
