@@ -24,7 +24,10 @@ def _snapshot(value):
         # TypeError for non-serializable values (e.g. self), ValueError for
         # circular containers (json.dumps raises ValueError for those, not
         # TypeError).
-        return repr(value)
+        try:
+            return repr(value)
+        except Exception:  # noqa: BLE001 - a raising __repr__ must not abort the target
+            return f"<unrepresentable {type(value).__name__}>"
 
 
 def _trace_calls(frame, event, arg):

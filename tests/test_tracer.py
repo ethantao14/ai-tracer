@@ -273,6 +273,30 @@ def test_falls_back_to_repr_for_a_circular_container_arg():
     ]
 
 
+class _RaisesOnRepr:
+    def __repr__(self):
+        raise RuntimeError("broken repr")
+
+
+def sample_function_with_a_broken_repr_arg(value):
+    return value
+
+
+def test_falls_back_to_a_placeholder_when_repr_itself_raises():
+    obj = _RaisesOnRepr()
+
+    tracer.start("tests")
+    sample_function_with_a_broken_repr_arg(obj)
+    calls = tracer.stop()
+
+    assert calls == [
+        {
+            "qualname": "sample_function_with_a_broken_repr_arg",
+            "args": {"value": "<unrepresentable _RaisesOnRepr>"},
+        }
+    ]
+
+
 def sample_outer_with_a_closure(secret):
     unused_local = "not passed to inner"  # noqa: F841
 
