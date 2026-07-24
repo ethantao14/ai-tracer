@@ -23,12 +23,17 @@ def run(target_path, program_args=()):
     # doesn't leak in as an accidental import source.
     original_sys_path = list(sys.path)
     sys.path[0] = target_dir
+    # Snapshotted before any sys.modules changes below, so it can undo both
+    # the eviction and whatever the target itself imports, run() can be
+    # called more than once in the same interpreter (our own tests do
+    # this), nothing should leak between calls, matching separate
+    # `python target.py` processes.
+    original_sys_modules = dict(sys.modules)
     # Our own imports (e.g. pathlib above) already populate sys.modules,
     # unlike a fresh `python target.py` process. Evict anything the target
     # directory defines itself so a same-named local file can shadow it.
     for name in _local_module_names(target_dir):
         sys.modules.pop(name, None)
-    original_sys_modules = set(sys.modules)
     # runpy.run_path only replaces argv[0], everything else needs to be set
     # explicitly: our own argv shouldn't leak into the target, and target
     # args need to actually reach it. runpy.run_path also resets argv[0]
@@ -44,11 +49,8 @@ def run(target_path, program_args=()):
         # Restore the whole list, not just index 0, in case the target
         # itself mutated sys.path (it runs in-process).
         sys.path[:] = original_sys_path
-        # run() can be called more than once in the same interpreter (our
-        # own tests do this), whatever the target imported would otherwise
-        # stay cached and could leak into a later, unrelated run().
-        for name in set(sys.modules) - original_sys_modules:
-            del sys.modules[name]
+        sys.modules.clear()
+        sys.modules.update(original_sys_modules)
 
 
 def main():

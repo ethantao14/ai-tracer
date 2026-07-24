@@ -172,6 +172,26 @@ def test_run_does_not_leak_imported_modules_into_a_later_run(tmp_path):
     assert "helper" not in sys.modules
 
 
+def test_run_restores_a_module_it_evicted_for_shadowing(tmp_path):
+    # run() evicts sys.modules entries that collide with the target
+    # directory (see the pathlib-shadowing test above), the original
+    # module needs to come back afterward, not just have its target-local
+    # replacement removed, leaving the caller with it missing entirely.
+    import pathlib
+
+    original_pathlib = sys.modules["pathlib"]
+
+    target_dir = tmp_path / "target_program"
+    target_dir.mkdir()
+    (target_dir / "pathlib.py").write_text("MARKER = 'local'\n")
+    (target_dir / "main.py").write_text("import pathlib\n")
+
+    cli.run(str(target_dir / "main.py"))
+
+    assert sys.modules["pathlib"] is original_pathlib
+    assert pathlib.Path is not None
+
+
 def test_cli_forwards_extra_arguments_to_the_target_program(tmp_path):
     # `run.sh app.py --config cfg.yml` should behave like
     # `python app.py --config cfg.yml`.
