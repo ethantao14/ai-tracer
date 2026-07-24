@@ -20,10 +20,10 @@ def _snapshot(value):
     # falls back to repr for anything that isn't JSON-serializable (e.g. self).
     try:
         return json.loads(json.dumps(value))
-    except (TypeError, ValueError):
-        # TypeError for non-serializable values (e.g. self), ValueError for
-        # circular containers (json.dumps raises ValueError for those, not
-        # TypeError).
+    except Exception:  # noqa: BLE001 - any encoding failure must not abort the target
+        # Not just TypeError (non-serializable, e.g. self) or ValueError
+        # (circular containers): a container subclass with a raising
+        # __iter__/__repr__/keys() can make the encoder raise anything.
         try:
             return repr(value)
         except Exception:  # noqa: BLE001 - a raising __repr__ must not abort the target

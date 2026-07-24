@@ -273,6 +273,32 @@ def test_falls_back_to_repr_for_a_circular_container_arg():
     ]
 
 
+class _RaisesDuringIteration(list):
+    def __iter__(self):
+        raise RuntimeError("broken iter")
+
+
+def sample_function_with_an_arg_that_breaks_json_encoding(value):
+    return value
+
+
+def test_falls_back_to_repr_when_json_encoding_raises_something_unexpected():
+    # A container subclass can make json.dumps raise something other than
+    # the TypeError/ValueError it raises for ordinary unserializable values.
+    broken = _RaisesDuringIteration([1, 2])
+
+    tracer.start("tests")
+    sample_function_with_an_arg_that_breaks_json_encoding(broken)
+    calls = tracer.stop()
+
+    assert calls == [
+        {
+            "qualname": "sample_function_with_an_arg_that_breaks_json_encoding",
+            "args": {"value": repr(broken)},
+        }
+    ]
+
+
 class _RaisesOnRepr:
     def __repr__(self):
         raise RuntimeError("broken repr")
