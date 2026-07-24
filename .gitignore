@@ -1,6 +1,9 @@
 # ai-tracer local environment
 .venv/
 
+# Working handoff notes for continuing sessions/agents, not part of the project
+CODEX_HANDOFF.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

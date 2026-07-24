@@ -43,7 +43,11 @@ def _to_json_safe(value):
                 "integer exceeds the interpreter's max str digits"
             ) from None
         return value
-    if value_type in _JSON_SAFE_SCALAR_TYPES:
+    # `in` on a tuple compares with ==, which for a class object with a
+    # custom metaclass __eq__ would call that target-defined method (and
+    # could even lie and return True, letting the object itself through
+    # unvalidated). `is` never invokes anything overridable.
+    if any(value_type is safe_type for safe_type in _JSON_SAFE_SCALAR_TYPES):
         return value
     if value_type is list or value_type is tuple:
         return [_to_json_safe(item) for item in value]

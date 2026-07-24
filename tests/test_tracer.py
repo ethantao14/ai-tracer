@@ -379,6 +379,44 @@ def test_falls_back_to_a_safe_placeholder_for_an_int_too_large_to_stringify():
     ]
 
 
+def sample_function_with_a_custom_metaclass_arg(value):
+    return value
+
+
+def test_snapshotting_never_calls_a_custom_metaclass_eq():
+    # `value_type in _JSON_SAFE_SCALAR_TYPES` would compare with ==, which
+    # for a class object with a custom metaclass __eq__ calls that
+    # target-defined method - even though value_type is never actually one
+    # of those safe types, so this comparison serves no purpose worth that
+    # risk.
+    log = []
+
+    class SideEffectingMeta(type):
+        def __eq__(cls, other):
+            log.append(("eq", other))
+            return False
+
+        def __hash__(cls):
+            return object.__hash__(cls)
+
+    class WithCustomMetaclass(metaclass=SideEffectingMeta):
+        pass
+
+    obj = WithCustomMetaclass()
+
+    tracer.start("tests")
+    sample_function_with_a_custom_metaclass_arg(obj)
+    calls = tracer.stop()
+
+    assert log == []
+    assert calls == [
+        {
+            "qualname": "sample_function_with_a_custom_metaclass_arg",
+            "args": {"value": object.__repr__(obj)},
+        }
+    ]
+
+
 class _RaisesOnRepr:
     def __repr__(self):
         raise RuntimeError("broken repr")
