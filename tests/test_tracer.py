@@ -414,6 +414,75 @@ def test_snapshotting_never_calls_a_side_effecting_repr():
     ]
 
 
+class _SideEffectingReprKey:
+    def __init__(self, log):
+        self._log = log
+
+    def __repr__(self):
+        self._log.append("key repr called")
+        return "SideEffectingReprKey()"
+
+    def __hash__(self):
+        return 0
+
+
+def sample_function_with_a_non_string_dict_key_arg(value):
+    return value
+
+
+def test_rejecting_a_non_string_dict_key_never_calls_its_repr():
+    # The TypeError raised for a non-string key must not build a message
+    # via repr(key): that would call the key's own __repr__ just to
+    # construct an error that gets immediately discarded.
+    log = []
+    key = _SideEffectingReprKey(log)
+    arg = {key: 1}
+
+    tracer.start("tests")
+    sample_function_with_a_non_string_dict_key_arg(arg)
+    calls = tracer.stop()
+
+    assert log == []
+    assert calls == [
+        {
+            "qualname": "sample_function_with_a_non_string_dict_key_arg",
+            "args": {"value": object.__repr__(arg)},
+        }
+    ]
+
+
+def sample_generator_that_deletes_its_own_argument(x):
+    yield 1
+    del x
+    yield 2
+    yield 3
+
+
+def test_tolerates_a_generator_deleting_its_own_argument_before_a_resume():
+    # A generator/coroutine frame fires another "call" event on each
+    # resume, not just when first entered. If the function already deleted
+    # one of its own parameters by then, it's simply missing from f_locals
+    # on that later "call" event, not a bug the tracer should crash on.
+    tracer.start("tests")
+    gen = sample_generator_that_deletes_its_own_argument(5)
+    next(gen)
+    next(gen)
+    next(gen)
+    calls = tracer.stop()
+
+    assert calls == [
+        {
+            "qualname": "sample_generator_that_deletes_its_own_argument",
+            "args": {"x": 5},
+        },
+        {
+            "qualname": "sample_generator_that_deletes_its_own_argument",
+            "args": {"x": 5},
+        },
+        {"qualname": "sample_generator_that_deletes_its_own_argument", "args": {}},
+    ]
+
+
 def sample_outer_with_a_closure(secret):
     unused_local = "not passed to inner"  # noqa: F841
 

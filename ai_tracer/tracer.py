@@ -20,12 +20,16 @@ def _to_json_safe(value):
     # plain list/dict can't run user code, but a subclass could override
     # __iter__/keys()/etc. with side effects, and json.dumps would call
     # straight into those while we're just trying to observe the argument.
+    # These raises never interpolate the value or its type name: an f-string
+    # `!r` calls repr(), and even `value_type.__name__` can run target code
+    # for a custom metaclass overriding __getattribute__ - and every one of
+    # these messages is immediately caught and discarded by _snapshot below.
     value_type = type(value)
     if value_type is float:
         if not math.isfinite(value):
             # json.dumps emits bare NaN/Infinity, which isn't valid JSON and
             # would corrupt the .trace.json file it ends up written into.
-            raise ValueError(f"non-finite float: {value!r}")
+            raise ValueError("non-finite float")
         return value
     if value_type in _JSON_SAFE_SCALAR_TYPES:
         return value
@@ -35,10 +39,10 @@ def _to_json_safe(value):
         result = {}
         for key, item in value.items():
             if type(key) is not str:
-                raise TypeError(f"non-string dict key: {key!r}")
+                raise TypeError("non-string dict key")
             result[key] = _to_json_safe(item)
         return result
-    raise TypeError(f"not a JSON-safe value: {value_type.__name__}")
+    raise TypeError("not a JSON-safe value")
 
 
 def _snapshot(value):
@@ -91,7 +95,15 @@ def _trace_calls(frame, event, arg):
         names.append(arg_info.varargs)
     if arg_info.keywords:
         names.append(arg_info.keywords)
-    args = {name: _snapshot(frame.f_locals[name]) for name in names}
+    # Python fires another "call" event each time a generator/coroutine
+    # frame is resumed, not just when it's first entered. If the function
+    # already `del`eted one of its own parameters before yielding, that name
+    # is gone from f_locals on the next resume.
+    args = {
+        name: _snapshot(frame.f_locals[name])
+        for name in names
+        if name in frame.f_locals
+    }
     _calls.append({"qualname": co.co_qualname, "args": args})
 
 
