@@ -350,9 +350,15 @@ def _render_conftest(target_dir):
         "# - the module itself, a sibling it imports, a package and any of its",
         "# already-cached submodules (popping just the package root would leave",
         "# a stale pkg.sub behind). Matches how ai-tracer imports target code.",
+        "# Skip this conftest's own top-level package: when the output dir is a",
+        "# package under the target dir (e.g. tests/ with an __init__.py), its",
+        "# name is target-local too, and deleting it would evict this very",
+        "# module while pytest is importing it, aborting collection.",
         f"_local = {tuple(local)!r}",
+        "_own = __name__.split('.')[0]",
         "for _name in list(sys.modules):",
-        "    if _name.split('.')[0] in _local:",
+        "    _top = _name.split('.')[0]",
+        "    if _top in _local and _top != _own:",
         "        del sys.modules[_name]",
     ]
     return "\n".join(lines) + "\n"

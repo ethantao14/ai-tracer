@@ -754,7 +754,7 @@ def test_conftest_evicts_cached_target_modules_once_for_the_session(tmp_path):
     assert "'helper'" in conftest and "'config'" in conftest
     # Eviction is by top-level name, so a cached pkg.sub is cleared too, not
     # only the bare package root.
-    assert "_name.split('.')[0] in _local" in conftest
+    assert "_top in _local" in conftest
     # Test files no longer do their own eviction; they just import.
     assert "_local" not in (output_dir / "test_helper.py").read_text()
 
@@ -830,6 +830,42 @@ def test_a_target_conftest_is_not_in_the_eviction_set(tmp_path):
     generator.generate(str(trace_path), str(tmp_path), str(output_dir))
 
     assert "'conftest'" not in (output_dir / "conftest.py").read_text()
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_output_dir_that_is_a_package_under_target_does_not_self_evict(tmp_path):
+    # When the output dir is a package under the target dir (a real tests/ with
+    # __init__.py), "tests" is a target-local name, so the generated
+    # tests/conftest.py must not evict its own package - deleting
+    # sys.modules['tests.conftest'] mid-import aborts collection with KeyError.
+    (tmp_path / "helper.py").write_text("def f():\n    return 1\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import f\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    f()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "tests"
+    output_dir.mkdir()
+    (output_dir / "__init__.py").write_text("")
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    assert "_top != _own" in (output_dir / "conftest.py").read_text()
 
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", str(output_dir)],
