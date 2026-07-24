@@ -614,6 +614,8 @@ def test_a_top_level_call_has_no_parent():
             "raised": False,
             "return_value": "done",
             "return_serialization": "json",
+            "exception_module": None,
+            "exception_type": None,
         }
     ]
 
@@ -902,6 +904,52 @@ def test_records_raised_true_when_an_exception_propagates_uncaught():
     assert calls[0]["return_serialization"] is None
 
 
+def test_records_the_type_and_module_of_a_builtin_exception():
+    tracer.start("tests")
+    try:
+        sample_function_that_raises()
+    except ValueError:
+        pass
+    calls = tracer.stop()
+
+    assert calls[0]["exception_type"] == "ValueError"
+    assert calls[0]["exception_module"] == "builtins"
+
+
+class SampleCustomError(Exception):
+    pass
+
+
+def sample_function_that_raises_a_custom_exception():
+    raise SampleCustomError("custom boom")
+
+
+def test_records_the_type_and_module_of_a_target_defined_exception():
+    # A target-defined exception's __module__ is the module it was defined in,
+    # exactly the same name the tracer records for a function call there - so
+    # the two are consistent and a consumer can import the exception the same
+    # way it imports the function under test.
+    tracer.start("tests")
+    try:
+        sample_function_that_raises_a_custom_exception()
+    except SampleCustomError:
+        pass
+    calls = tracer.stop()
+
+    assert calls[0]["exception_type"] == "SampleCustomError"
+    assert calls[0]["exception_module"] == "test_tracer"
+
+
+def test_a_call_that_did_not_raise_has_null_exception_fields():
+    tracer.start("tests")
+    sample_function()
+    calls = tracer.stop()
+
+    assert calls[0]["raised"] is False
+    assert calls[0]["exception_type"] is None
+    assert calls[0]["exception_module"] is None
+
+
 def sample_function_that_catches_and_returns():
     try:
         raise ValueError("boom")
@@ -959,6 +1007,10 @@ def test_records_raised_true_for_a_frame_that_merely_lets_an_exception_pass_thro
     calls = tracer.stop()
 
     assert all(c["raised"] is True for c in calls)
+    # Both the raising inner frame and the outer frame the exception merely
+    # passes through record the same propagating exception's type.
+    assert all(c["exception_type"] == "ValueError" for c in calls)
+    assert all(c["exception_module"] == "builtins" for c in calls)
 
 
 _shared_non_serializable_return_value = _NotJSONSerializable()

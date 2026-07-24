@@ -96,6 +96,29 @@ def _snapshot(value):
         return object.__repr__(value), "repr"
 
 
+def _exception_info(exc_type):
+    # The module and qualified name of the exception class that propagated out
+    # of a call. Both are read via type.__getattribute__ - the unbound base
+    # implementation - so a custom metaclass overriding __getattribute__ can't
+    # run target code while we observe (same reasoning as object.__repr__ in
+    # _snapshot). Each is then snapshotted, so a class with a non-string
+    # __module__/__qualname__ can't break the final json.dumps of the trace.
+    # __module__ here is consistent with how function calls are recorded: a
+    # target exception defined in the entry script reads "__main__", matching
+    # the function-frame module resolution, and a builtin reads "builtins".
+    try:
+        module = type.__getattribute__(exc_type, "__module__")
+    except Exception:  # noqa: BLE001 - reading a target class attr must never abort
+        module = None
+    try:
+        qualname = type.__getattribute__(exc_type, "__qualname__")
+    except Exception:  # noqa: BLE001 - reading a target class attr must never abort
+        qualname = None
+    module_value, _ = _snapshot(module)
+    type_value, _ = _snapshot(qualname)
+    return module_value, type_value
+
+
 def _trace_calls(frame):
     co = frame.f_code
     # Synthetic filenames like "<frozen importlib._bootstrap>" aren't real
@@ -175,11 +198,16 @@ def _make_local_tracer(record, previous_local):
     # threads can both obtain a call_id before either appends its record, so
     # call_id is not reliably that record's index into the shared _calls
     # list once multiple threads are calling into traced code concurrently.
-    state = {"previous_local": previous_local, "saw_exception": False}
+    state = {"previous_local": previous_local, "saw_exception": False, "exc_type": None}
 
     def handler(frame, event, arg):
         if record is not None and event == "exception":
             state["saw_exception"] = True
+            # arg is (exc_type, exc_value, traceback). Keep the latest one:
+            # the exception actually unwinding out of the frame is the last
+            # one seen before it exits, and only that one is recorded if the
+            # frame turns out to have raised.
+            state["exc_type"] = arg[0]
         elif record is not None and event == "return":
             # "return" fires for every frame exit, exceptional or not, with
             # arg set to the actual return value only for a genuine return -
@@ -195,10 +223,19 @@ def _make_local_tracer(record, previous_local):
             if arg is not None:
                 record["raised"] = False
                 record["return_value"], record["return_serialization"] = _snapshot(arg)
+                record["exception_module"] = None
+                record["exception_type"] = None
             else:
                 record["raised"] = state["saw_exception"]
                 record["return_value"] = None
                 record["return_serialization"] = None
+                if state["saw_exception"]:
+                    record["exception_module"], record["exception_type"] = (
+                        _exception_info(state["exc_type"])
+                    )
+                else:
+                    record["exception_module"] = None
+                    record["exception_type"] = None
             stack = _call_stack()
             if stack and stack[-1] == record["call_id"]:
                 stack.pop()

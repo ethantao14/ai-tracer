@@ -36,8 +36,8 @@ Every function the target program calls (in files under the target's own directo
 
 ```json
 [
-  { "call_id": 0, "parent_call_id": null, "module": "__main__", "qualname": "main", "args": {}, "arg_serialization": {}, "raised": false, "return_value": null, "return_serialization": null },
-  { "call_id": 1, "parent_call_id": 0, "module": "helper", "qualname": "double", "args": { "x": 21 }, "arg_serialization": { "x": "json" }, "raised": false, "return_value": 42, "return_serialization": "json" }
+  { "call_id": 0, "parent_call_id": null, "module": "__main__", "qualname": "main", "args": {}, "arg_serialization": {}, "raised": false, "return_value": null, "return_serialization": null, "exception_module": null, "exception_type": null },
+  { "call_id": 1, "parent_call_id": 0, "module": "helper", "qualname": "double", "args": { "x": 21 }, "arg_serialization": { "x": "json" }, "raised": false, "return_value": 42, "return_serialization": "json", "exception_module": null, "exception_type": null }
 ]
 ```
 
@@ -48,6 +48,8 @@ Every function the target program calls (in files under the target's own directo
 Argument and return values are recorded as JSON-safe snapshots: taken as of the moment the call happened (or returned), not whatever they become afterward, and falling back to `repr()` for anything that isn't JSON-serializable (e.g. a custom object). `arg_serialization` (per argument name) and `return_serialization` mark which kind each one is, `"json"` for a real JSON value or `"repr"` for a fallback string, so a consumer can tell "the target actually passed/returned this string" apart from "this string is just a repr() of something unrepresentable." `return_serialization` is `null` whenever `return_value` is (a call that raised, or one whose `"return"` event couldn't distinguish a real value from `None`).
 
 `raised` is `true` if the call exited via an exception instead of a normal return, in which case `return_value` is always `null`. This is a best-effort signal, not a perfect one: a call that catches its own exception and then explicitly returns a non-`None` value is always detected correctly, but a call that catches its own exception and then returns `None` - explicitly (`return None`) or implicitly (no `return` statement afterward) - is indistinguishable, at this level, from one that let the exception propagate - `raised` is set to `true` in that ambiguous case too, favoring never missing a real propagating exception over occasionally over-reporting one.
+
+When `raised` is `true`, `exception_type` and `exception_module` name the exception that came out of the call: its `__qualname__` (e.g. `"ValueError"`) and the module it was defined in (`"builtins"` for a built-in exception, or the same module name a function defined there would get, e.g. `"__main__"` for one defined in the entry script). Both are `null` for a call that returned normally. A frame the exception merely passes through records the same propagating exception as the frame that raised it. In the ambiguous catch-then-return-`None` case above, these name whichever exception the frame last saw.
 
 ---
 
