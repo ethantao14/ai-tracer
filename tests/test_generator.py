@@ -588,6 +588,78 @@ def test_stale_generated_tests_are_cleared_on_rerun(tmp_path):
     assert not (output_dir / "test_helper.py").exists()
 
 
+def test_rerun_does_not_delete_user_test_files_in_the_output_dir(tmp_path):
+    # The output dir can be an existing test folder the user also keeps their
+    # own tests in. Regeneration must only remove files it generated (marked),
+    # never a hand-written test_*.py or a target module named test_*.py.
+    (tmp_path / "helper.py").write_text("def f():\n    return 1\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import f\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    f()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "tests_dir"
+    output_dir.mkdir()
+    user_test = output_dir / "test_mine.py"
+    user_test.write_text("def test_user_written():\n    assert True\n")
+
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    # The user's own file survives; the generated one was written.
+    assert user_test.read_text() == "def test_user_written():\n    assert True\n"
+    assert (output_dir / "test_helper.py").exists()
+
+    # A second run with nothing generatable still leaves the user's file alone
+    # while clearing the previously generated one.
+    empty_trace = _trace(
+        tmp_path,
+        "def main():\n    return 1\n\n\nif __name__ == '__main__':\n    main()\n",
+        filename="other.py",
+    )
+    generator.generate(str(empty_trace), str(tmp_path), str(output_dir))
+
+    assert user_test.exists()
+    assert not (output_dir / "test_helper.py").exists()
+
+
+def test_sys_path_is_restored_after_a_target_mutates_it_at_import(tmp_path):
+    (tmp_path / "helper.py").write_text(
+        "import sys\n"
+        "sys.path.insert(0, '/definitely/not/a/real/leak/path')\n"
+        "\n"
+        "\n"
+        "def f():\n"
+        "    return 1\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import f\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    f()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    before = list(sys.path)
+    generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert sys.path == before
+
+
 def test_skips_a_call_whose_module_name_is_a_non_string(tmp_path, capsys):
     # A target that rebinds __name__ to a JSON-safe non-string is recorded
     # verbatim; generation must report it as invalid, not crash on .split().
