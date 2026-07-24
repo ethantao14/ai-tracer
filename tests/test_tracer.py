@@ -743,3 +743,20 @@ def test_start_does_not_blind_a_previously_active_tracer_across_return_events():
 
     assert "call" in seen
     assert "return" in seen
+
+
+def sample_function_outside_target_dir():
+    return sys._getframe().f_trace
+
+
+def test_installs_no_local_tracer_for_an_unrecorded_frame_with_nothing_else_watching(
+    tmp_path,
+):
+    # A frame that's neither recorded by us (outside target_dir here) nor
+    # wanted by any other tracer shouldn't get a no-op local tracer
+    # installed - that would still cost a callback per frame for nothing.
+    tracer.start(str(tmp_path))
+    own_f_trace = sample_function_outside_target_dir()
+    tracer.stop()
+
+    assert own_f_trace is None

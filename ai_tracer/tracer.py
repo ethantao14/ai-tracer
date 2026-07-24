@@ -176,6 +176,13 @@ def _dispatch(frame, event, arg):
         else _previous_thread_trace
     )
     previous_local = previous(frame, event, arg) if previous is not None else None
+    if call_id is None and previous_local is None:
+        # Nothing to do for this frame: we didn't record it (outside
+        # target_dir, or not a real function call), and no other tool wants
+        # to observe it either. Installing a no-op local tracer here would
+        # still cost a "return" callback for every such frame - stdlib-heavy
+        # targets could have a lot of these.
+        return None
     if previous_local is None:
         # No other tool is watching this frame, so "line" events (fired per
         # source line, far more often than call/return) are pure overhead -
