@@ -86,6 +86,48 @@ def test_cli_does_not_leak_its_own_argv_into_the_target(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_cli_preserves_the_original_program_string_in_argv_0(tmp_path):
+    # `python app.py` leaves sys.argv[0] as the literal string "app.py",
+    # not its resolved absolute path. A target that inspects or prints its
+    # own invocation path should see the same thing through this harness.
+    (tmp_path / "argvy.py").write_text(
+        "import sys\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    assert sys.argv[0] == 'argvy.py', sys.argv\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", "argvy.py"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_run_restores_the_whole_sys_path_even_if_the_target_mutates_it(tmp_path):
+    # run() executes the target in-process. Only restoring sys.path[0]
+    # would leave the rest polluted if the target mutates sys.path more
+    # broadly than that (clears it, appends to it, reassigns it), or raise
+    # IndexError trying to restore an index into a list the target emptied.
+    original_path = list(sys.path)
+
+    target = tmp_path / "path_mutator.py"
+    target.write_text("import sys\nsys.path.clear()\nsys.path.append('/nonsense')\n")
+
+    cli.run(str(target))
+
+    assert sys.path == original_path
+
+
 def test_cli_forwards_extra_arguments_to_the_target_program(tmp_path):
     # `./run.sh app.py --config cfg.yml` should behave like
     # `python app.py --config cfg.yml`, the target's own arguments have to
