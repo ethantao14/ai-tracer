@@ -144,17 +144,15 @@ def test_skips_a_method_call(tmp_path, capsys):
     assert not (tmp_path / "generated_tests" / "test_helper.py").exists()
 
 
-def test_skips_a_function_with_unsupported_varargs_signature(tmp_path, capsys):
-    (tmp_path / "helper.py").write_text(
-        "def with_varargs(*args, **kwargs):\n    return args\n"
-    )
+def test_skips_a_function_with_a_positional_only_parameter(tmp_path, capsys):
+    (tmp_path / "helper.py").write_text("def posonly(x, /):\n    return x + 1\n")
     trace_path = _trace(
         tmp_path,
-        "from helper import with_varargs\n"
+        "from helper import posonly\n"
         "\n"
         "\n"
         "def main():\n"
-        "    with_varargs(1, 2)\n"
+        "    posonly(1)\n"
         "\n"
         "\n"
         'if __name__ == "__main__":\n'
@@ -166,7 +164,7 @@ def test_skips_a_function_with_unsupported_varargs_signature(tmp_path, capsys):
     )
 
     assert written == []
-    assert "unsupported signature" in capsys.readouterr().err
+    assert "positional-only" in capsys.readouterr().err
 
 
 def test_skips_a_call_whose_module_name_is_not_a_valid_import_target(tmp_path, capsys):
@@ -330,6 +328,192 @@ def test_a_target_sibling_shadowing_a_cached_module_wins(tmp_path):
     # afterward rather than left evicted.
     assert written == [output_dir / "test_helper.py"]
     assert restored is stale
+
+
+def test_skips_a_call_that_returns_a_tuple(tmp_path, capsys):
+    # `return a, b` produces a tuple, which the tracer flattens to a JSON
+    # array. Generating `assert result == [a, b]` would fail (a tuple isn't
+    # equal to a list), so skip it until the trace can tell them apart.
+    (tmp_path / "helper.py").write_text("def pair():\n    return 1, 2\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import pair\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    pair()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    written = generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert written == []
+    assert "return value contains a list/array" in capsys.readouterr().err
+
+
+def test_skips_a_call_with_a_list_argument(tmp_path, capsys):
+    (tmp_path / "helper.py").write_text("def first(items):\n    return items[0]\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import first\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    first([10, 20])\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    written = generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert written == []
+    assert "an argument contains a list/array" in capsys.readouterr().err
+
+
+def test_skips_a_call_with_a_list_nested_inside_a_dict_argument(tmp_path, capsys):
+    (tmp_path / "helper.py").write_text("def lookup(data):\n    return data['k'][0]\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import lookup\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    lookup({'k': [1, 2]})\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    written = generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert written == []
+    assert "an argument contains a list/array" in capsys.readouterr().err
+
+
+def test_generates_a_passing_test_for_a_dict_return_value(tmp_path):
+    # A dict (unlike a tuple) round-trips through JSON unchanged, so it's
+    # still generatable as long as it holds no arrays.
+    (tmp_path / "helper.py").write_text("def wrap(x):\n    return {'value': x}\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import wrap\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    wrap(5)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    assert written == [output_dir / "test_helper.py"]
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_skips_a_generator_function(tmp_path, capsys):
+    (tmp_path / "helper.py").write_text(
+        "def counter(n):\n    yield n\n    yield n + 1\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import counter\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    list(counter(1))\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    written = generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert written == []
+    assert "plain synchronous call" in capsys.readouterr().err
+
+
+def test_skips_an_async_function(tmp_path, capsys):
+    (tmp_path / "helper.py").write_text(
+        "import asyncio\n\n\nasync def fetch(x):\n    return x * 2\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "import asyncio\n"
+        "\n"
+        "from helper import fetch\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    asyncio.run(fetch(21))\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert not (tmp_path / "generated_tests" / "test_helper.py").exists()
+
+
+def test_colliding_module_filenames_do_not_overwrite_each_other(tmp_path):
+    # "pkg.sub" and "pkg_sub" both flatten to test_pkg_sub.py; the second
+    # must not clobber the first.
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "sub.py").write_text("def a():\n    return 1\n")
+    (tmp_path / "pkg_sub.py").write_text("def b():\n    return 2\n")
+    trace_path = _trace(
+        tmp_path,
+        "from pkg.sub import a\n"
+        "from pkg_sub import b\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    a()\n"
+        "    b()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    # Two distinct files, no overwrite, and both are real files on disk.
+    assert len(written) == 2
+    assert len({p.name for p in written}) == 2
+    assert all(p.exists() for p in written)
 
 
 def test_generates_one_test_per_call_with_an_index_suffix(tmp_path):

@@ -20,6 +20,21 @@ def _is_valid_import_name(part):
     return part.isidentifier() and not keyword.iskeyword(part)
 
 
+def _contains_array(value):
+    # The tracer flattens both lists and tuples to JSON arrays (json has no
+    # tuple type), so a recorded array is genuinely ambiguous: rendering it
+    # as a list literal silently changes a tuple into a list, and
+    # `(1, 2) == [1, 2]` is False, so the generated assertion would fail.
+    # Until the trace preserves the distinction, any value containing an
+    # array anywhere (including nested inside a dict) can't be reconstructed
+    # faithfully.
+    if isinstance(value, list):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_array(item) for item in value.values())
+    return False
+
+
 def _local_module_names(target_dir):
     names = set()
     for entry in Path(target_dir).iterdir():
@@ -67,11 +82,25 @@ def generate(trace_log_path, target_dir, output_dir="generated_tests"):
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True, parents=True)
 
+    # Two distinct module names can flatten to the same file name (dots
+    # become underscores, so "pkg.sub" and "pkg_sub" both want
+    # test_pkg_sub.py). Assign names in sorted order (deterministic) and
+    # append a numeric suffix on any real collision, so one module's tests
+    # never silently overwrite another's.
+    used_names = {}
     written_paths = []
-    for module_name, module_calls in calls_by_module.items():
-        file_name = f"test_{module_name.replace('.', '_')}.py"
+    for module_name in sorted(calls_by_module):
+        base = f"test_{module_name.replace('.', '_')}"
+        file_name = f"{base}.py"
+        suffix = 1
+        while file_name in used_names:
+            file_name = f"{base}_{suffix}.py"
+            suffix += 1
+        used_names[file_name] = module_name
         test_path = output_path / file_name
-        test_path.write_text(_render_test_module(module_name, module_calls, target_dir))
+        test_path.write_text(
+            _render_test_module(module_name, calls_by_module[module_name], target_dir)
+        )
         written_paths.append(test_path)
 
     return written_paths
@@ -112,6 +141,10 @@ def _skip_reason(call, module_cache, signature_cache):
     # `null` and is a perfectly safe literal). Only "repr" is unusable.
     if call["return_serialization"] == "repr":
         return "return value could not be captured as a JSON value"
+    if any(_contains_array(value) for value in call["args"].values()):
+        return "an argument contains a list/array (a tuple can't be told apart from a list in the trace yet)"
+    if _contains_array(call["return_value"]):
+        return "return value contains a list/array (a tuple can't be told apart from a list in the trace yet)"
     # Importing re-executes the module's top-level code, which can raise
     # anything, including whatever originally crashed the target program
     # (the tracer writes the trace log even when the target crashed). Check
@@ -126,8 +159,9 @@ def _skip_reason(call, module_cache, signature_cache):
     )
     if signature is None:
         return (
-            "function no longer exists, or has an unsupported signature "
-            "(positional-only, *args, or **kwargs)"
+            "function no longer exists, or can't be replayed as a plain "
+            "synchronous call (async, generator, positional-only, *args, or "
+            "**kwargs)"
         )
     # Even a supported signature may no longer accept the recorded argument
     # names (the function was renamed, its parameters changed, a new required
@@ -183,11 +217,22 @@ def _get_signature(module_name, qualname, module_cache, signature_cache):
         except (AttributeError, TypeError, ValueError):
             signature_cache[key] = None
         else:
+            # A coroutine/generator/async-generator function returns a
+            # coroutine or (async) generator object when called, not the
+            # value the tracer recorded (which it captured on await/resume),
+            # so a plain synchronous `result = f(...)` test never matches.
+            not_plainly_callable = (
+                inspect.iscoroutinefunction(function)
+                or inspect.isgeneratorfunction(function)
+                or inspect.isasyncgenfunction(function)
+            )
             has_unsupported_kind = any(
                 p.kind in _UNSUPPORTED_PARAM_KINDS
                 for p in signature.parameters.values()
             )
-            signature_cache[key] = None if has_unsupported_kind else signature
+            signature_cache[key] = (
+                None if not_plainly_callable or has_unsupported_kind else signature
+            )
     return signature_cache[key]
 
 
