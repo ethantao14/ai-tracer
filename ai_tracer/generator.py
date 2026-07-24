@@ -283,13 +283,15 @@ def _get_module(module_name, module_cache):
     if module_name not in module_cache:
         try:
             module_cache[module_name] = importlib.import_module(module_name)
-        except (Exception, SystemExit):  # noqa: BLE001 - target import can raise anything
+        except KeyboardInterrupt:
+            # Left to propagate so the user can still cancel a run.
+            raise
+        except BaseException:  # noqa: BLE001 - target import can raise anything
             # Importing re-runs the target's top-level code, which can raise
-            # anything - including SystemExit (a BaseException, not an
-            # Exception) from a module that calls sys.exit() or parses args at
-            # import time. Both mean "not safely importable now", not "abort
-            # the whole generation run"; KeyboardInterrupt is deliberately left
-            # to propagate so the user can still cancel.
+            # anything - not just Exception but BaseException subclasses too
+            # (SystemExit from a module that calls sys.exit() or parses args at
+            # import, GeneratorExit, asyncio.CancelledError). All of them mean
+            # "not safely importable now", not "abort the whole generation run".
             module_cache[module_name] = None
     return module_cache[module_name]
 

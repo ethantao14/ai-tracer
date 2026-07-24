@@ -1057,6 +1057,33 @@ def test_skips_a_module_that_calls_sys_exit_at_import(tmp_path, capsys):
     assert "could not be imported" in capsys.readouterr().err
 
 
+def test_skips_a_module_that_raises_a_bare_base_exception_at_import(tmp_path, capsys):
+    # Import-time failures aren't limited to Exception/SystemExit: a module can
+    # raise other BaseException subclasses (GeneratorExit here). These must be
+    # caught and the call skipped, not left to abort the whole run.
+    (tmp_path / "helper.py").write_text("def works():\n    return 1\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import works\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    works()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+    (tmp_path / "helper.py").write_text("raise GeneratorExit('gone')\n")
+
+    written = generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert written == []
+    assert "could not be imported" in capsys.readouterr().err
+
+
 def test_skips_a_call_whose_module_name_is_a_non_string(tmp_path, capsys):
     # A target that rebinds __name__ to a JSON-safe non-string is recorded
     # verbatim; generation must report it as invalid, not crash on .split().
