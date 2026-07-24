@@ -95,7 +95,7 @@ def test_skips_a_call_with_a_non_json_serializable_arg(tmp_path, capsys):
     assert "could not be captured as a JSON value" in capsys.readouterr().err
 
 
-def test_skips_a_call_that_raised(tmp_path, capsys):
+def test_generates_a_passing_pytest_raises_test_for_a_builtin_exception(tmp_path):
     (tmp_path / "helper.py").write_text("def fails():\n    raise ValueError('boom')\n")
     trace_path = _trace(
         tmp_path,
@@ -113,12 +113,97 @@ def test_skips_a_call_that_raised(tmp_path, capsys):
         "    main()\n",
     )
 
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    assert written == [output_dir / "test_helper.py"]
+    source = (output_dir / "test_helper.py").read_text()
+    assert "import pytest" in source
+    assert "with pytest.raises(ValueError):" in source
+    assert "fails()" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_generates_a_passing_pytest_raises_test_for_a_target_exception(tmp_path):
+    (tmp_path / "errors.py").write_text("class AppError(Exception):\n    pass\n")
+    (tmp_path / "helper.py").write_text(
+        "from errors import AppError\n\n\ndef boom(x):\n    raise AppError(x)\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import boom\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    try:\n"
+        "        boom(3)\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    source = (output_dir / "test_helper.py").read_text()
+    # The exception module is imported qualified and referenced by dotted name.
+    assert "import errors" in source
+    assert "with pytest.raises(errors.AppError):" in source
+    assert "boom(x=3)" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_skips_a_raised_call_whose_exception_module_is_the_entry_script(
+    tmp_path, capsys
+):
+    # An exception defined in the entry script (module "__main__") has no
+    # importable path, so it can't be named in the generated pytest.raises and
+    # the raised call is skipped. Built as a literal trace to isolate exactly
+    # this case (it's awkward to produce naturally with JSON-safe args).
+    (tmp_path / "helper.py").write_text("def boom():\n    raise ValueError('x')\n")
+    trace = [
+        {
+            "call_id": 0,
+            "parent_call_id": None,
+            "module": "helper",
+            "qualname": "boom",
+            "args": {},
+            "arg_serialization": {},
+            "raised": True,
+            "return_value": None,
+            "return_serialization": None,
+            "exception_module": "__main__",
+            "exception_type": "LocalError",
+        }
+    ]
+    trace_path = tmp_path / "program.trace.json"
+    trace_path.write_text(json.dumps(trace))
+
     written = generator.generate(
         str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
     )
 
     assert written == []
-    assert "raised an exception" in capsys.readouterr().err
+    assert "exception module '__main__'" in capsys.readouterr().err
 
 
 def test_skips_a_method_call(tmp_path, capsys):

@@ -1,3 +1,4 @@
+import builtins
 import importlib
 import inspect
 import json
@@ -235,21 +236,27 @@ def _skip_reason(call, module_cache, signature_cache):
             "call didn't finish before tracing stopped (e.g. an unjoined worker thread)"
         )
     # Non-JSON (repr-fallback) values are never reconstructable as a
-    # literal, don't generate a test that's likely to be wrong.
+    # literal, don't generate a test that's likely to be wrong. This applies
+    # whether the call returned or raised - either way its arguments are
+    # replayed to make the call.
     if any(kind != "json" for kind in call["arg_serialization"].values()):
         return "one or more arguments could not be captured as a JSON value"
-    if call["raised"]:
-        return "call raised an exception, not supported yet"
-    # raised is False here, so return_serialization is "json" (a real JSON
-    # value), "repr" (a non-serializable value we can't reconstruct as a
-    # literal), or None (a genuine None return, which json.dumps handles as
-    # `null` and is a perfectly safe literal). Only "repr" is unusable.
-    if call["return_serialization"] == "repr":
-        return "return value could not be captured as a JSON value"
     if any(_contains_array(value) for value in call["args"].values()):
         return "an argument contains a list/array (a tuple can't be told apart from a list in the trace yet)"
-    if _contains_array(call["return_value"]):
-        return "return value contains a list/array (a tuple can't be told apart from a list in the trace yet)"
+    if call["raised"]:
+        # A raised call becomes a `with pytest.raises(...)` test, so the
+        # exception it raised has to be referenceable in the generated file.
+        exception_reason = _exception_skip_reason(call, module_cache)
+        if exception_reason is not None:
+            return exception_reason
+    else:
+        # return_serialization is "json" (a real JSON value), "repr" (a
+        # non-serializable value we can't reconstruct as a literal), or None
+        # (a genuine None return, a safe literal). Only "repr" is unusable.
+        if call["return_serialization"] == "repr":
+            return "return value could not be captured as a JSON value"
+        if _contains_array(call["return_value"]):
+            return "return value contains a list/array (a tuple can't be told apart from a list in the trace yet)"
     # Importing re-executes the module's top-level code, which can raise
     # anything, including whatever originally crashed the target program
     # (the tracer writes the trace log even when the target crashed). Check
@@ -277,6 +284,36 @@ def _skip_reason(call, module_cache, signature_cache):
         signature.bind(**dict.fromkeys(call["args"]))
     except TypeError:
         return "recorded arguments no longer match the function's signature"
+    return None
+
+
+def _exception_skip_reason(call, module_cache):
+    # For a raised call, decide whether its exception can be named in a
+    # `pytest.raises(...)`. Returns None if it can, else a skip reason.
+    exception_type = call["exception_type"]
+    exception_module = call["exception_module"]
+    # A well-formed trace always records a plain string type and module, but
+    # the tracer snapshots target-controlled values, so guard before use.
+    if not isinstance(exception_type, str) or not _is_valid_import_name(exception_type):
+        return f"exception type {exception_type!r} is not a plain identifier"
+    if exception_module == "builtins":
+        # Built-in exceptions need no import; reference the name directly, but
+        # only if it really is one (a malformed trace could name a non-builtin).
+        if not hasattr(builtins, exception_type):
+            return f"exception {exception_type!r} is not a builtin"
+        return None
+    # Same limits as a function's own module: the entry script has no
+    # importable path, and the name has to be a valid dotted import target.
+    if not isinstance(exception_module, str) or exception_module == "__main__":
+        return (
+            f"exception module {exception_module!r} can't be imported "
+            "(the entry script has no real import path, or it isn't a module name)"
+        )
+    if not all(_is_valid_import_name(part) for part in exception_module.split(".")):
+        return f"exception module {exception_module!r} is not a valid import target"
+    module = _get_module(exception_module, module_cache)
+    if module is None or not hasattr(module, exception_type):
+        return f"exception {exception_module}.{exception_type} could not be imported"
     return None
 
 
@@ -397,17 +434,31 @@ def _render_test_module(module_name, module_calls, target_dir):
     while result_var in imported_names:
         result_var = "_" + result_var
 
+    has_raises = any(call["raised"] for call in module_calls)
+    # Exception modules are imported qualified (`import errors`, referenced as
+    # `errors.AppError`), never `from errors import AppError`, so they can't
+    # collide with the function names pulled in below - even when the exception
+    # lives in the same module as the function under test. Built-in exceptions
+    # need no import and are referenced by bare name.
+    exception_modules = sorted(
+        {
+            call["exception_module"]
+            for call in module_calls
+            if call["raised"] and call["exception_module"] != "builtins"
+        }
+    )
+
     # The conftest.py generated alongside this file evicts stale/shadowing
     # target modules once for the whole session; this per-file sys.path.insert
     # is a fallback so imports still resolve if that conftest was skipped (the
     # user already had one) or the file is run on its own.
-    lines = [
-        _GENERATED_MARKER,
-        "import sys",
-        "",
-        f"sys.path.insert(0, {target_dir!r})",
-        f"from {module_name} import {', '.join(imported_names)}",
-    ]
+    lines = [_GENERATED_MARKER, "import sys"]
+    if has_raises:
+        lines.append("import pytest")
+    lines += ["", f"sys.path.insert(0, {target_dir!r})"]
+    for exception_module in exception_modules:
+        lines.append(f"import {exception_module}")
+    lines.append(f"from {module_name} import {', '.join(imported_names)}")
 
     call_counts = {}
     for call in module_calls:
@@ -418,10 +469,23 @@ def _render_test_module(module_name, module_calls, target_dir):
         args = ", ".join(f"{name}={value!r}" for name, value in call["args"].items())
         lines += ["", ""]
         lines.append(f"def test_{qualname}_{index}():")
-        lines.append(f"    {result_var} = {qualname}({args})")
-        lines.append(f"    assert {result_var} == {call['return_value']!r}")
+        if call["raised"]:
+            lines.append(f"    with pytest.raises({_exception_reference(call)}):")
+            lines.append(f"        {qualname}({args})")
+        else:
+            lines.append(f"    {result_var} = {qualname}({args})")
+            lines.append(f"    assert {result_var} == {call['return_value']!r}")
 
     return "\n".join(lines) + "\n"
+
+
+def _exception_reference(call):
+    # How the exception is named in a `pytest.raises(...)`: a bare identifier
+    # for a builtin (ValueError), or module-qualified for a target exception
+    # (errors.AppError), matching how its module was imported.
+    if call["exception_module"] == "builtins":
+        return call["exception_type"]
+    return f"{call['exception_module']}.{call['exception_type']}"
 
 
 def main():
