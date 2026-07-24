@@ -614,6 +614,8 @@ def test_a_top_level_call_has_no_parent():
             "raised": False,
             "return_value": "done",
             "return_serialization": "json",
+            "exception_module": None,
+            "exception_type": None,
         }
     ]
 
@@ -902,6 +904,135 @@ def test_records_raised_true_when_an_exception_propagates_uncaught():
     assert calls[0]["return_serialization"] is None
 
 
+def test_records_the_type_and_module_of_a_builtin_exception():
+    tracer.start("tests")
+    try:
+        sample_function_that_raises()
+    except ValueError:
+        pass
+    calls = tracer.stop()
+
+    assert calls[0]["exception_type"] == "ValueError"
+    assert calls[0]["exception_module"] == "builtins"
+
+
+class SampleCustomError(Exception):
+    pass
+
+
+def sample_function_that_raises_a_custom_exception():
+    raise SampleCustomError("custom boom")
+
+
+def test_records_the_type_and_module_of_a_target_defined_exception():
+    # A target-defined exception's __module__ is the module it was defined in,
+    # exactly the same name the tracer records for a function call there - so
+    # the two are consistent and a consumer can import the exception the same
+    # way it imports the function under test.
+    tracer.start("tests")
+    try:
+        sample_function_that_raises_a_custom_exception()
+    except SampleCustomError:
+        pass
+    calls = tracer.stop()
+
+    assert calls[0]["exception_type"] == "SampleCustomError"
+    assert calls[0]["exception_module"] == "test_tracer"
+
+
+def test_a_call_that_did_not_raise_has_null_exception_fields():
+    tracer.start("tests")
+    sample_function()
+    calls = tracer.stop()
+
+    assert calls[0]["raised"] is False
+    assert calls[0]["exception_type"] is None
+    assert calls[0]["exception_module"] is None
+
+
+def sample_function_that_reraises_a_different_type():
+    try:
+        raise ValueError("first")
+    except ValueError:
+        raise KeyError("second")
+
+
+def test_records_the_reraised_exception_not_the_caught_one():
+    # `except A: raise B` - the exception that actually escapes is B, and
+    # that's what the last "exception" event carries, so it's recorded.
+    tracer.start("tests")
+    try:
+        sample_function_that_reraises_a_different_type()
+    except KeyError:
+        pass
+    calls = tracer.stop()
+
+    assert calls[0]["exception_type"] == "KeyError"
+
+
+_METACLASS_MODULE_PROPERTY_RAN = []
+
+
+class _SideEffectingExceptionMeta(type):
+    @property
+    def __module__(cls):
+        _METACLASS_MODULE_PROPERTY_RAN.append(True)
+        return "faked_module"
+
+
+class _ExceptionWithSideEffectingMeta(Exception, metaclass=_SideEffectingExceptionMeta):
+    pass
+
+
+def sample_function_that_raises_a_metaclass_exception():
+    raise _ExceptionWithSideEffectingMeta("boom")
+
+
+def test_recording_an_exception_never_runs_a_metaclass_module_property():
+    # Reading exc_type.__module__ directly would invoke this metaclass
+    # property (target code running just because we observed an exception).
+    # type's own descriptor is used instead, which returns the real module
+    # and never triggers the property.
+    _METACLASS_MODULE_PROPERTY_RAN.clear()
+
+    tracer.start("tests")
+    try:
+        sample_function_that_raises_a_metaclass_exception()
+    except _ExceptionWithSideEffectingMeta:
+        pass
+    calls = tracer.stop()
+
+    assert _METACLASS_MODULE_PROPERTY_RAN == []
+    assert calls[0]["exception_type"] == "_ExceptionWithSideEffectingMeta"
+    assert calls[0]["exception_module"] == "test_tracer"
+
+
+def sample_function_with_a_finally_that_raises_and_catches():
+    try:
+        raise ValueError("escapes")
+    finally:
+        try:
+            raise KeyError("handled in finally")
+        except KeyError:
+            pass
+
+
+def test_finally_that_raises_and_catches_records_the_finally_exception():
+    # Documented limitation: the ValueError is what actually escapes, but the
+    # finally block's KeyError is the last "exception" event and the escaping
+    # ValueError re-emerges without another event, so KeyError is what gets
+    # recorded here. `raised` is still correctly True.
+    tracer.start("tests")
+    try:
+        sample_function_with_a_finally_that_raises_and_catches()
+    except ValueError:
+        pass
+    calls = tracer.stop()
+
+    assert calls[0]["raised"] is True
+    assert calls[0]["exception_type"] == "KeyError"
+
+
 def sample_function_that_catches_and_returns():
     try:
         raise ValueError("boom")
@@ -959,6 +1090,10 @@ def test_records_raised_true_for_a_frame_that_merely_lets_an_exception_pass_thro
     calls = tracer.stop()
 
     assert all(c["raised"] is True for c in calls)
+    # Both the raising inner frame and the outer frame the exception merely
+    # passes through record the same propagating exception's type.
+    assert all(c["exception_type"] == "ValueError" for c in calls)
+    assert all(c["exception_module"] == "builtins" for c in calls)
 
 
 _shared_non_serializable_return_value = _NotJSONSerializable()

@@ -610,6 +610,8 @@ def test_cli_trace_records_main_for_the_entry_script(tmp_path):
             "raised": False,
             "return_value": 1,
             "return_serialization": "json",
+            "exception_module": None,
+            "exception_type": None,
         }
     ]
 
@@ -748,8 +750,11 @@ def test_cli_trace_includes_return_values_and_raised_status(tmp_path):
     by_qualname = {c["qualname"]: c for c in trace}
     assert by_qualname["doubles"]["raised"] is False
     assert by_qualname["doubles"]["return_value"] == 42
+    assert by_qualname["doubles"]["exception_type"] is None
     assert by_qualname["fails"]["raised"] is True
     assert by_qualname["fails"]["return_value"] is None
+    assert by_qualname["fails"]["exception_type"] == "ValueError"
+    assert by_qualname["fails"]["exception_module"] == "builtins"
     # An explicit non-None return after catching is unambiguous, unlike an
     # implicit `return None` after a catch (covered separately in
     # test_tracer.py's ambiguity tests).
