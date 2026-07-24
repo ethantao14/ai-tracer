@@ -516,6 +516,105 @@ def test_colliding_module_filenames_do_not_overwrite_each_other(tmp_path):
     assert all(p.exists() for p in written)
 
 
+def test_two_submodules_of_one_package_do_not_re_run_its_init(tmp_path):
+    # Importing pkg.a then pkg.b must run pkg/__init__.py exactly once, like a
+    # normal run - not once per submodule. A package whose __init__ appends to
+    # a list would grow it on every re-run, so both submodules generating
+    # cleanly is the observable proof __init__ wasn't re-executed underneath.
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        "import os\n"
+        "_MARKER = os.path.join(os.path.dirname(__file__), 'init_runs.txt')\n"
+        "with open(_MARKER, 'a') as fh:\n"
+        "    fh.write('x')\n"
+    )
+    (pkg / "a.py").write_text("def fa():\n    return 1\n")
+    (pkg / "b.py").write_text("def fb():\n    return 2\n")
+    trace_path = _trace(
+        tmp_path,
+        "from pkg.a import fa\n"
+        "from pkg.b import fb\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    fa()\n"
+        "    fb()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+    # Clear the marker the traced run wrote, so we only measure generate()'s
+    # own imports.
+    (pkg / "init_runs.txt").write_text("")
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    assert {p.name for p in written} == {"test_pkg_a.py", "test_pkg_b.py"}
+    # __init__ ran exactly once for the whole package, not once per submodule.
+    assert (pkg / "init_runs.txt").read_text() == "x"
+
+
+def test_stale_generated_tests_are_cleared_on_rerun(tmp_path):
+    (tmp_path / "helper.py").write_text("def f():\n    return 1\n")
+    first_trace = _trace(
+        tmp_path,
+        "from helper import f\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    f()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(str(first_trace), str(tmp_path), str(output_dir))
+    assert (output_dir / "test_helper.py").exists()
+
+    # A second trace with no generatable calls (only the entry script) must
+    # leave the output dir empty, not keep the first run's stale file.
+    second_trace = _trace(
+        tmp_path,
+        "def main():\n    return 1\n\n\nif __name__ == '__main__':\n    main()\n",
+        filename="other.py",
+    )
+    written = generator.generate(str(second_trace), str(tmp_path), str(output_dir))
+
+    assert written == []
+    assert not (output_dir / "test_helper.py").exists()
+
+
+def test_skips_a_call_whose_module_name_is_a_non_string(tmp_path, capsys):
+    # A target that rebinds __name__ to a JSON-safe non-string is recorded
+    # verbatim; generation must report it as invalid, not crash on .split().
+    (tmp_path / "helper.py").write_text(
+        "__name__ = 123\n\n\ndef broken():\n    return 1\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "import helper\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    helper.broken()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    written = generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert written == []
+    assert "not a valid import target" in capsys.readouterr().err
+
+
 def test_generates_one_test_per_call_with_an_index_suffix(tmp_path):
     (tmp_path / "helper.py").write_text("def double(x):\n    return x * 2\n")
     trace_path = _trace(

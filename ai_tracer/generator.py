@@ -62,8 +62,14 @@ def generate(trace_log_path, target_dir, output_dir="generated_tests"):
     # test, so a target sibling (e.g. a local inspect.py, or a module cached
     # from a previous generate() call) wins over a stale/stdlib module of the
     # same name - matching how the CLI runs the target in the first place.
-    for name in _local_module_names(target_dir):
-        sys.modules.pop(name, None)
+    # Also evict any already-cached submodule of a local package ("pkg.a"),
+    # so a stale submodule can't be reused without re-importing; the package
+    # is then imported fresh once and its "pkg.a"/"pkg.b" submodules build on
+    # that single import, exactly as a normal run would.
+    local_names = _local_module_names(target_dir)
+    for name in list(sys.modules):
+        if name.split(".")[0] in local_names:
+            sys.modules.pop(name, None)
     try:
         for call in calls:
             reason = _skip_reason(call, module_cache, signature_cache)
@@ -81,6 +87,14 @@ def generate(trace_log_path, target_dir, output_dir="generated_tests"):
 
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True, parents=True)
+
+    # Clear previously generated tests before writing this run's, so a module
+    # that's no longer generatable (its calls now all skipped, or gone from
+    # the trace) doesn't leave a stale test_*.py behind for pytest to run.
+    # Only the generator's own test_*.py files are removed, not anything else
+    # a user might keep in this directory.
+    for stale in output_path.glob("test_*.py"):
+        stale.unlink()
 
     # Two distinct module names can flatten to the same file name (dots
     # become underscores, so "pkg.sub" and "pkg_sub" both want
@@ -127,7 +141,12 @@ def _skip_reason(call, module_cache, signature_cache):
     # together, where the CLI already has that path.
     if call["module"] == "__main__":
         return "the entry script's own functions aren't generatable yet (module \"__main__\" has no real import path)"
-    if not all(_is_valid_import_name(part) for part in call["module"].split(".")):
+    # A target that rebinds its own __name__ to a JSON-safe non-string (e.g.
+    # __name__ = 123) is recorded verbatim by the tracer, so guard before
+    # treating module as a dotted string.
+    if not isinstance(call["module"], str) or not all(
+        _is_valid_import_name(part) for part in call["module"].split(".")
+    ):
         return f"module {call['module']!r} is not a valid import target"
     # Non-JSON (repr-fallback) values are never reconstructable as a
     # literal, don't generate a test that's likely to be wrong.
@@ -175,27 +194,17 @@ def _skip_reason(call, module_cache, signature_cache):
     return None
 
 
-def _fresh_import(module_name):
-    # generate() already evicts the target dir's own top-level names before
-    # the run, but a dotted name ("pkg.calc") also needs every prefix popped:
-    # if the parent package ("pkg") got re-cached as a side effect of an
-    # earlier import in this same run, its __path__ could still point at a
-    # stale location, so re-importing the submodule would find the wrong file
-    # through the stale parent.
-    parts = module_name.split(".")
-    for i in range(len(parts)):
-        sys.modules.pop(".".join(parts[: i + 1]), None)
-    return importlib.import_module(module_name)
-
-
 def _get_module(module_name, module_cache):
-    # Cached per generate() call (not a module-level global, that would
-    # leak across separate calls, see _fresh_import), so a module
-    # referenced by many calls is only actually imported, and its top-level
-    # code only actually re-executed, once.
+    # Cached per generate() call (not a module-level global, which would leak
+    # imported target modules across separate calls), so a module referenced
+    # by many calls is only imported, and its top-level code only
+    # re-executed, once. generate() has already evicted the target dir's own
+    # names from sys.modules up front, so this first import is fresh; a
+    # package's submodules then build on that single package import the same
+    # way a normal run would, without re-running its __init__.py per submodule.
     if module_name not in module_cache:
         try:
-            module_cache[module_name] = _fresh_import(module_name)
+            module_cache[module_name] = importlib.import_module(module_name)
         except Exception:  # noqa: BLE001 - importing target code can raise anything
             module_cache[module_name] = None
     return module_cache[module_name]

@@ -87,6 +87,8 @@ Not every recorded call becomes a test. A call is skipped, with a one-line reaso
 - Its recorded arguments no longer bind to the function's current signature (a parameter was renamed, removed, or a new required one was added since it was traced), which would make the generated call fail outright.
 - It belongs to the entry script (module `"__main__"`). A bare trace log doesn't carry the entry script's file path, so its own functions can't be imported by name yet - this is lifted once tracing and generation share a single command.
 
+**Known limitation (default arguments):** the trace records every parameter present in the call frame, including ones the caller left at their default, and can't tell an omitted argument from one passed explicitly. The generated test always passes each recorded argument by keyword. For the overwhelmingly common cases (immutable defaults like `None`, numbers, strings) this is exactly correct. It only misbehaves for a parameter whose default is a JSON-serializable object the function then compares by identity (e.g. `DEFAULT = {}` used as a sentinel via `x is DEFAULT`): the generated call passes a fresh equal object rather than the original default, so an identity check flips. Fixing this properly needs the tracer to record which arguments were passed explicitly, which is out of scope here.
+
 ---
 
 ## Development
