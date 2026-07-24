@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 
@@ -1055,6 +1056,76 @@ def test_skips_a_module_that_calls_sys_exit_at_import(tmp_path, capsys):
 
     assert written == []
     assert "could not be imported" in capsys.readouterr().err
+
+
+def test_a_target_that_chdirs_at_import_does_not_leak_cwd_or_misplace_output(
+    tmp_path,
+):
+    # A target module that calls os.chdir() at import time must not leave the
+    # caller in that directory, and a relative output_dir must still resolve
+    # against the original cwd, not the target's new one.
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (tmp_path / "helper.py").write_text(
+        f"import os\n\nos.chdir({str(other)!r})\n\n\ndef f():\n    return 1\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import f\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    f()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    original_cwd = os.getcwd()
+    os.chdir(workdir)
+    try:
+        generator.generate(str(trace_path), str(tmp_path), "generated_tests")
+        # cwd is restored, and the relative output landed under workdir, not
+        # under the directory the target chdir'd into.
+        assert os.getcwd() == str(workdir)
+        assert (workdir / "generated_tests" / "test_helper.py").exists()
+        assert not (other / "generated_tests").exists()
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_skips_a_function_whose_getattr_hook_raises(tmp_path, capsys):
+    # A module with a __getattr__ that raises (e.g. the function was removed and
+    # the hook now errors) can raise something other than AttributeError when
+    # looked up. That must be skipped, not abort the whole run.
+    (tmp_path / "helper.py").write_text("def works():\n    return 1\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import works\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    works()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+    # Replace the module: importable, but looking up `works` raises a
+    # non-AttributeError via __getattr__.
+    (tmp_path / "helper.py").write_text(
+        "def __getattr__(name):\n    raise RuntimeError('gone: ' + name)\n"
+    )
+
+    written = generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert written == []
+    assert "Skipping helper.works" in capsys.readouterr().err
 
 
 def test_skips_a_module_that_raises_a_bare_base_exception_at_import(tmp_path, capsys):

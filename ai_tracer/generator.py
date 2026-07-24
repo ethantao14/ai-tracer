@@ -2,6 +2,7 @@ import importlib
 import inspect
 import json
 import keyword
+import os
 import sys
 from pathlib import Path
 
@@ -87,19 +88,26 @@ def _local_module_names(target_dir):
 def generate(trace_log_path, target_dir, output_dir="generated_tests"):
     calls = json.loads(Path(trace_log_path).read_text())
     target_dir = str(Path(target_dir).resolve())
+    # Resolve the output directory to an absolute path now, before importing
+    # any target code: a target module that changes the process cwd at import
+    # time would otherwise make a relative output_dir (like the default
+    # "generated_tests") resolve against the target's new cwd.
+    output_path = Path(output_dir).resolve()
 
     calls_by_module = {}
     module_cache = {}
     signature_cache = {}
 
-    # Snapshot sys.path and sys.modules so anything a target module changes at
-    # import time (a module that inserts its own sys.path entry, say) and every
-    # module imported while inspecting target code is undone afterward, keeping
-    # repeated generate() calls in one process hermetic. Restoring the whole
+    # Snapshot sys.path, sys.modules and the cwd so anything a target module
+    # changes at import time (inserting a sys.path entry, calling os.chdir()) and
+    # every module imported while inspecting target code is undone afterward,
+    # keeping repeated generate() calls in one process hermetic and not leaving
+    # the caller in a directory the target moved to. Restoring the whole sys.path
     # snapshot also can't raise the way a lone list.remove(target_dir) could if
     # the target had already removed that entry itself.
     original_sys_path = list(sys.path)
     original_sys_modules = dict(sys.modules)
+    original_cwd = os.getcwd()
     sys.path.insert(0, target_dir)
     # Evict every name the target dir defines, not just the module under
     # test, so a target sibling (e.g. a local inspect.py, or a module cached
@@ -127,8 +135,8 @@ def generate(trace_log_path, target_dir, output_dir="generated_tests"):
         sys.path[:] = original_sys_path
         sys.modules.clear()
         sys.modules.update(original_sys_modules)
+        os.chdir(original_cwd)
 
-    output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True, parents=True)
 
     # Clear previously generated tests before writing this run's, so a module
@@ -309,7 +317,15 @@ def _get_signature(module_name, qualname, module_cache, signature_cache):
         try:
             function = getattr(module, qualname)
             signature = inspect.signature(function)
-        except (AttributeError, TypeError, ValueError):
+        except KeyboardInterrupt:
+            # Left to propagate so the user can still cancel a run.
+            raise
+        except BaseException:  # noqa: BLE001 - target hooks can raise anything
+            # getattr can run a module's __getattr__ and inspect.signature can
+            # run a __signature__ hook; both are target code that can raise
+            # anything (not just Attribute/Type/ValueError) if the function was
+            # removed or replaced since it was traced. Treat any such failure as
+            # "not introspectable" and skip, rather than aborting the whole run.
             signature_cache[key] = None
         else:
             # A coroutine/generator/async-generator function returns a
