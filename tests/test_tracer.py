@@ -599,6 +599,26 @@ def test_a_top_level_call_has_no_parent():
     ]
 
 
+def test_falls_back_to_repr_for_a_non_json_safe_module_name():
+    # A target can rebind its own module-level __name__ to anything; that
+    # value must go through the same snapshotting as args, or a target
+    # doing this breaks json.dumps() for the whole trace, not just this call.
+    def sample_function_for_module_repr_test():
+        pass
+
+    original_name = globals()["__name__"]
+    fake_name = object()
+    globals()["__name__"] = fake_name
+    try:
+        tracer.start("tests")
+        sample_function_for_module_repr_test()
+        calls = tracer.stop()
+    finally:
+        globals()["__name__"] = original_name
+
+    assert calls[0]["module"] == object.__repr__(fake_name)
+
+
 def test_a_nested_call_has_its_caller_as_parent():
     tracer.start("tests")
     sample_caller()

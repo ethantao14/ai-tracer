@@ -142,7 +142,10 @@ def _trace_calls(frame):
     # execution), the real dotted name for an imported module, and
     # correctly "pkg" rather than "pkg.__init__" for a package's __init__.py
     # - no need to reconstruct any of that from the file path ourselves.
-    module = frame.f_globals.get("__name__")
+    # Snapshotted like any other target-controlled value: a target that
+    # rebinds its own __name__ to something non-JSON-safe must not be able
+    # to break the eventual json.dumps() of the whole trace.
+    module = _snapshot(frame.f_globals.get("__name__"))
     _calls.append(
         {
             "call_id": call_id,
