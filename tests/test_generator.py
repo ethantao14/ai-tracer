@@ -118,8 +118,9 @@ def test_generates_a_passing_pytest_raises_test_for_a_builtin_exception(tmp_path
 
     assert written == [output_dir / "test_helper.py"]
     source = (output_dir / "test_helper.py").read_text()
-    assert "import pytest" in source
-    assert "with pytest.raises(ValueError):" in source
+    assert "import pytest as _raises_pytest" in source
+    assert "import builtins as _raises_builtins" in source
+    assert "with _raises_pytest.raises(_raises_builtins.ValueError):" in source
     assert "fails()" in source
 
     result = subprocess.run(
@@ -160,7 +161,7 @@ def test_generates_a_passing_pytest_raises_test_for_a_target_exception(tmp_path)
     # The exception module is imported under a reserved alias and referenced
     # through it, so it can't be shadowed by a same-named function import.
     assert "import errors as _raises_errors" in source
-    assert "with pytest.raises(_raises_errors.AppError):" in source
+    assert "with _raises_pytest.raises(_raises_errors.AppError):" in source
     assert "boom(x=3)" in source
 
     result = subprocess.run(
@@ -174,10 +175,8 @@ def test_generates_a_passing_pytest_raises_test_for_a_target_exception(tmp_path)
 
 
 def test_exception_module_alias_survives_a_same_named_function(tmp_path):
-    # helper defines both a function `errors` and raises `errors.AppError` from
-    # a sibling `errors` module. The exception module's reserved alias must not
-    # be shadowed by `from helper import errors`, or pytest.raises would
-    # resolve `errors` to the function and the test would fail.
+    # helper defines a function `errors` and raises `errors.AppError` from a
+    # sibling `errors` module; the alias must survive `from helper import errors`.
     (tmp_path / "errors.py").write_text("class AppError(Exception):\n    pass\n")
     (tmp_path / "helper.py").write_text(
         "from errors import AppError\n"
@@ -211,10 +210,9 @@ def test_exception_module_alias_survives_a_same_named_function(tmp_path):
     generator.generate(str(trace_path), str(tmp_path), str(output_dir))
 
     source = (output_dir / "test_helper.py").read_text()
-    # The function `errors` is imported, and the exception module is aliased.
     assert "from helper import boom, errors" in source
     assert "import errors as _raises_errors" in source
-    assert "with pytest.raises(_raises_errors.AppError):" in source
+    assert "with _raises_pytest.raises(_raises_errors.AppError):" in source
 
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", str(output_dir)],
@@ -226,16 +224,61 @@ def test_exception_module_alias_survives_a_same_named_function(tmp_path):
     assert "2 passed" in result.stdout
 
 
+def test_raised_call_is_generated_when_the_exception_module_only_imports_cleanly_after_the_function_module(
+    tmp_path,
+):
+    # Circular pair: cold-importing the exception module first fails (it
+    # eagerly reads an attribute off the partial function module), but the
+    # function module first succeeds. generate() must try that order first.
+    (tmp_path / "errors.py").write_text(
+        "import helper\n\n\nclass AppError(Exception):\n    pass\n"
+    )
+    (tmp_path / "helper.py").write_text(
+        "import errors\n"
+        "\n"
+        "CHECK = errors.AppError\n"
+        "\n"
+        "\n"
+        "def boom(x):\n"
+        "    raise errors.AppError(x)\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import boom\n"
+        "from errors import AppError\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    try:\n"
+        "        boom(1)\n"
+        "    except AppError:\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    assert written == [output_dir / "test_helper.py"]
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
 def test_emits_pytest_raises_for_the_recorded_raised_flag_even_if_a_false_positive(
     tmp_path,
 ):
-    # Documented, accepted limitation: the generator trusts the trace's raised
-    # flag (it never re-runs the function to second-guess it). A function that
-    # catches its own exception and returns None is recorded as raised, so a
-    # pytest.raises test is emitted for it. That generated test would fail when
-    # run (the function actually returns None), which is the known tradeoff of
-    # trusting the recording - so this asserts the emitted shape, not a passing
-    # run.
+    # Documented limitation: the generator trusts the trace's raised flag, so
+    # a catch-and-return-None function still gets a pytest.raises test, which
+    # would fail if run. Asserts the emitted shape, not a passing run.
     (tmp_path / "helper.py").write_text(
         "def safe_get(d, k):\n"
         "    try:\n"
@@ -260,16 +303,14 @@ def test_emits_pytest_raises_for_the_recorded_raised_flag_even_if_a_false_positi
     generator.generate(str(trace_path), str(tmp_path), str(output_dir))
 
     source = (output_dir / "test_helper.py").read_text()
-    assert "with pytest.raises(KeyError):" in source
+    assert "with _raises_pytest.raises(_raises_builtins.KeyError):" in source
 
 
 def test_skips_a_raised_call_whose_exception_module_is_the_entry_script(
     tmp_path, capsys
 ):
-    # An exception defined in the entry script (module "__main__") has no
-    # importable path, so it can't be named in the generated pytest.raises and
-    # the raised call is skipped. Built as a literal trace to isolate exactly
-    # this case (it's awkward to produce naturally with JSON-safe args).
+    # module "__main__" has no importable path, so the raised call is
+    # skipped. Built as a literal trace since this is awkward to produce naturally.
     (tmp_path / "helper.py").write_text("def boom():\n    raise ValueError('x')\n")
     trace = [
         {
@@ -398,10 +439,8 @@ def test_skips_a_call_whose_module_fails_to_import(tmp_path, capsys):
 
 
 def test_generates_a_passing_test_for_a_function_that_returns_none(tmp_path):
-    # A function with no explicit return records raised=false,
-    # return_value=null, return_serialization=null. That's a genuine None
-    # return (a safe literal), not an uncapturable value - it must still
-    # generate a test that passes.
+    # return_serialization=null is a genuine None return (a safe literal),
+    # not an uncapturable value - must still generate a passing test.
     (tmp_path / "helper.py").write_text("def note(x):\n    pass\n")
     trace_path = _trace(
         tmp_path,
@@ -466,11 +505,9 @@ def test_skips_a_call_whose_args_no_longer_bind_to_the_current_signature(
 
 
 def test_a_target_sibling_shadowing_a_cached_module_wins(tmp_path):
-    # helper imports a sibling named "config". A module of the same name is
-    # already cached in sys.modules (simulating a stdlib/dependency name, or
-    # a leftover from a previous generate() call). The target's own sibling
-    # must win, or importing helper for signature inspection sees the wrong
-    # config and can wrongly skip a call that traced fine.
+    # A module named "config" is already cached in sys.modules (simulating
+    # a stdlib name or a leftover from a previous generate() call); the
+    # target's own sibling "config" must win.
     (tmp_path / "config.py").write_text("VALUE = 'target'\n")
     (tmp_path / "helper.py").write_text(
         "from config import VALUE\n\n\ndef describe(x):\n    return VALUE\n"
@@ -695,10 +732,8 @@ def test_colliding_module_filenames_do_not_overwrite_each_other(tmp_path):
 
 
 def test_two_submodules_of_one_package_do_not_re_run_its_init(tmp_path):
-    # Importing pkg.a then pkg.b must run pkg/__init__.py exactly once, like a
-    # normal run - not once per submodule. A package whose __init__ appends to
-    # a list would grow it on every re-run, so both submodules generating
-    # cleanly is the observable proof __init__ wasn't re-executed underneath.
+    # Importing pkg.a then pkg.b must run pkg/__init__.py exactly once,
+    # like a normal run - not once per submodule.
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     (pkg / "__init__.py").write_text(
@@ -937,11 +972,9 @@ def test_conftest_evicts_cached_target_modules_once_for_the_session(tmp_path):
 
 
 def test_skips_an_unfinished_call_record_without_crashing(tmp_path):
-    # A worker thread still running when the main script returns leaves its
-    # call in progress; tracer.stop() writes that record before its return
-    # event, so it has no raised/return_* fields. The generator must skip it
-    # with a reason, not crash on the missing keys. Built as a literal trace
-    # (rather than racing a real thread) to stay deterministic.
+    # An unjoined worker thread's record has no raised/return_* fields.
+    # Built as a literal trace (rather than racing a real thread) to stay
+    # deterministic.
     (tmp_path / "helper.py").write_text("def worker():\n    return 1\n")
     trace = [
         {
@@ -1019,10 +1052,8 @@ def test_a_target_conftest_is_not_in_the_eviction_set(tmp_path):
 
 
 def test_output_dir_that_is_a_package_under_target_does_not_self_evict(tmp_path):
-    # When the output dir is a package under the target dir (a real tests/ with
-    # __init__.py), "tests" is a target-local name, so the generated
-    # tests/conftest.py must not evict its own package - deleting
-    # sys.modules['tests.conftest'] mid-import aborts collection with KeyError.
+    # "tests" is a target-local name here, so the generated tests/conftest.py
+    # must not evict its own package (would abort collection with KeyError).
     (tmp_path / "helper.py").write_text("def f():\n    return 1\n")
     trace_path = _trace(
         tmp_path,
@@ -1055,10 +1086,8 @@ def test_output_dir_that_is_a_package_under_target_does_not_self_evict(tmp_path)
 
 
 def test_output_dir_nested_in_a_target_package_still_evicts_siblings(tmp_path):
-    # Output dir is a subpackage inside a target package (<target>/pkg/tests).
-    # The conftest's own ancestor chain (pkg, pkg.tests, pkg.tests.conftest)
-    # must be spared, but a sibling target submodule (pkg.calc) must still be
-    # evicted rather than skipped along with the whole pkg tree.
+    # Output dir <target>/pkg/tests: the conftest's own ancestor chain must
+    # be spared, but sibling pkg.calc must still be evicted.
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
@@ -1201,11 +1230,9 @@ def test_two_plain_modules_sharing_import_state_generate_passing_tests(tmp_path)
 
 
 def test_generated_tests_for_two_submodules_share_one_package_init(tmp_path):
-    # pytest imports all generated files in one process. If each test file
-    # evicted the shared package before importing its own submodule, the
-    # package's __init__ would re-run per file; a submodule reading a value the
-    # __init__ increments would then see a different value than the traced run.
-    # The generated tests must not do that - __init__ runs once for the run.
+    # If each test file evicted the shared package, __init__ would re-run
+    # per file, so a submodule reading its counter would see a different
+    # value than the traced run. __init__ must run once for the whole session.
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     (pkg / "__init__.py").write_text(
@@ -1451,10 +1478,8 @@ def test_writes_one_file_per_module(tmp_path):
 def test_a_stale_sys_modules_entry_from_an_earlier_generate_call_is_not_reused(
     tmp_path,
 ):
-    # generate() can run more than once in the same process pointing at
-    # different target_dirs whose modules happen to share a name - each
-    # call must re-import fresh rather than reuse whatever sys.modules
-    # cached from the previous one.
+    # Two target_dirs whose modules share a name: each generate() call must
+    # re-import fresh rather than reuse the previous call's sys.modules entry.
     first_dir = tmp_path / "first"
     first_dir.mkdir()
     (first_dir / "helper.py").write_text("def value():\n    return 'first'\n")

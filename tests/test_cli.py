@@ -212,10 +212,8 @@ def test_run_does_not_leak_imported_modules_into_a_later_run(tmp_path):
 
 
 def test_run_restores_a_module_it_evicted_for_shadowing(tmp_path):
-    # run() evicts sys.modules entries that collide with the target
-    # directory (see the pathlib-shadowing test above), the original
-    # module needs to come back afterward, not just have its target-local
-    # replacement removed, leaving the caller with it missing entirely.
+    # After eviction for shadowing, the original module must come back,
+    # not just be removed and left missing entirely.
     import pathlib
 
     original_pathlib = sys.modules["pathlib"]
@@ -455,10 +453,8 @@ def test_cli_trace_does_not_include_stdlib_calls(tmp_path):
 
 
 def test_cli_trace_survives_the_target_changing_its_own_working_directory(tmp_path):
-    # A relative program path keeps a relative co_filename for functions
-    # defined in it. If the target then chdir()s, resolving that filename
-    # against the *current* cwd (instead of the cwd run() started in) would
-    # point at the wrong directory and silently drop these calls.
+    # If the target chdir()s, resolving its relative co_filename against
+    # the *current* cwd (not the cwd run() started in) would drop these calls.
     target_dir = tmp_path / "target_dir"
     target_dir.mkdir()
     (target_dir / "elsewhere").mkdir()

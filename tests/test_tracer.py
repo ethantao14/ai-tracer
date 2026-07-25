@@ -318,10 +318,8 @@ def sample_function_with_an_arg_that_breaks_json_encoding(value):
 
 
 def test_falls_back_to_repr_for_a_list_subclass_with_a_raising_iter():
-    # A list/dict subclass is never introspected directly (see
-    # _to_json_safe), and its repr isn't trusted either (it could itself be
-    # overridden), so this uses object.__repr__ without ever calling the
-    # subclass's own __iter__ or __repr__.
+    # Falls back to object.__repr__ without ever calling the subclass's
+    # own __iter__ or __repr__.
     broken = _RaisesDuringIteration([1, 2])
 
     tracer.start("tests")
@@ -392,10 +390,8 @@ def sample_function_with_a_huge_int_arg(value):
 
 
 def test_falls_back_to_a_safe_placeholder_for_an_int_too_large_to_stringify():
-    # Past sys.get_int_max_str_digits() (default 4300 digits), even str()
-    # and repr() raise ValueError - the same limit json.dumps hits, which
-    # is exactly why this can't be left for the final write in cli.py to
-    # discover.
+    # Past sys.get_int_max_str_digits(), even str()/repr() raise ValueError -
+    # the same limit json.dumps hits later, too late to recover from.
     huge = 10**5000
 
     tracer.start("tests")
@@ -415,11 +411,8 @@ def sample_function_with_a_custom_metaclass_arg(value):
 
 
 def test_snapshotting_never_calls_a_custom_metaclass_eq():
-    # `value_type in _JSON_SAFE_SCALAR_TYPES` would compare with ==, which
-    # for a class object with a custom metaclass __eq__ calls that
-    # target-defined method - even though value_type is never actually one
-    # of those safe types, so this comparison serves no purpose worth that
-    # risk.
+    # `value_type in _JSON_SAFE_SCALAR_TYPES` would use ==, which a custom
+    # metaclass __eq__ could hijack; `is` never invokes anything overridable.
     log = []
 
     class SideEffectingMeta(type):
@@ -486,10 +479,8 @@ def sample_function_with_a_side_effecting_repr_arg(value):
 
 
 def test_snapshotting_never_calls_a_side_effecting_repr():
-    # A target's own __repr__ is arbitrary code (mutation, I/O); calling it
-    # just to represent an argument would run that code before the traced
-    # function body even executes, changing when the target's own side
-    # effects happen.
+    # A target's own __repr__ is arbitrary code; calling it to represent an
+    # argument would run it before the traced function body even executes.
     log = []
     obj = _SideEffectingRepr(log)
 
@@ -551,10 +542,8 @@ def sample_generator_that_deletes_its_own_argument(x):
 
 
 def test_tolerates_a_generator_deleting_its_own_argument_before_a_resume():
-    # A generator/coroutine frame fires another "call" event on each
-    # resume, not just when first entered. If the function already deleted
-    # one of its own parameters by then, it's simply missing from f_locals
-    # on that later "call" event, not a bug the tracer should crash on.
+    # A resumed generator fires another "call" event; a param it already
+    # deleted is simply missing from f_locals then, not a bug to crash on.
     tracer.start("tests")
     gen = sample_generator_that_deletes_its_own_argument(5)
     next(gen)
@@ -747,15 +736,9 @@ def sample_function_that_echoes(value):
 
 
 def test_return_values_are_attributed_correctly_under_thread_interleaving():
-    # A call_id is assigned (via the thread-safe counter) before its record
-    # is appended to _calls, so two threads can both obtain a call_id before
-    # either appends - call_id is not reliably that record's index into the
-    # shared list once threads race. Forces exactly that interleaving: both
-    # threads' module-name snapshot (the same value, "test_tracer", for
-    # both) rendezvous on a barrier, then thread A sleeps a little longer
-    # before its own record actually gets appended, so thread B's record
-    # lands at a lower list index than thread A's despite thread A having
-    # called _trace_calls (and obtained its call_id) first.
+    # call_id isn't reliably a record's index into _calls once threads race.
+    # Forces that: both threads rendezvous on a barrier, then thread A sleeps
+    # longer before its record is appended, landing after thread B's.
     barrier = threading.Barrier(2)
     original_snapshot = tracer._snapshot
 
@@ -794,13 +777,8 @@ def test_generator_resumes_are_recorded_as_separate_sibling_calls():
         yield 2
 
     def sample_driver():
-        # Fully exhausting the generator (not just retrieving every yielded
-        # value) avoids relying on garbage-collection timing: an abandoned,
-        # not-yet-exhausted generator gets an extra "call" event whenever
-        # Python happens to close() it during GC, which isn't deterministic
-        # across Python versions/builds - list() drains it via repeated
-        # next() until it raises StopIteration on its own, with no dangling
-        # suspended state left for GC to close later.
+        # list() fully drains the generator via StopIteration, rather than
+        # leaving it for GC to close() at some non-deterministic time.
         list(sample_generator())
 
     tracer.start("tests")
@@ -820,10 +798,9 @@ def test_generator_resumes_are_recorded_as_separate_sibling_calls():
 
 
 def test_start_does_not_blind_a_previously_active_tracer_across_return_events():
-    # _make_local_tracer now stays the local tracer for a frame's whole
-    # lifetime (it needs its own "return" event), unlike PR2's full
-    # hand-off. A previously-active tracer must still see every event it
-    # would have, including "return", not just "call".
+    # _make_local_tracer stays the local tracer for the frame's whole
+    # lifetime; a previously-active tracer must still see every event, not
+    # just "call".
     seen = []
 
     def other_tracer(frame, event, arg):
@@ -925,10 +902,8 @@ def sample_function_that_raises_a_custom_exception():
 
 
 def test_records_the_type_and_module_of_a_target_defined_exception():
-    # A target-defined exception's __module__ is the module it was defined in,
-    # exactly the same name the tracer records for a function call there - so
-    # the two are consistent and a consumer can import the exception the same
-    # way it imports the function under test.
+    # __module__ matches the name the tracer records for a function call
+    # there, so a consumer can import the exception the same way.
     tracer.start("tests")
     try:
         sample_function_that_raises_a_custom_exception()
@@ -990,9 +965,7 @@ def sample_function_that_raises_a_metaclass_exception():
 
 def test_recording_an_exception_never_runs_a_metaclass_module_property():
     # Reading exc_type.__module__ directly would invoke this metaclass
-    # property (target code running just because we observed an exception).
-    # type's own descriptor is used instead, which returns the real module
-    # and never triggers the property.
+    # property; type's own descriptor is used instead and never triggers it.
     _METACLASS_MODULE_PROPERTY_RAN.clear()
 
     tracer.start("tests")
@@ -1018,10 +991,8 @@ def sample_function_with_a_finally_that_raises_and_catches():
 
 
 def test_finally_that_raises_and_catches_records_the_finally_exception():
-    # Documented limitation: the ValueError is what actually escapes, but the
-    # finally block's KeyError is the last "exception" event and the escaping
-    # ValueError re-emerges without another event, so KeyError is what gets
-    # recorded here. `raised` is still correctly True.
+    # Documented limitation: ValueError actually escapes, but the finally's
+    # KeyError is the last "exception" event, so KeyError is recorded instead.
     tracer.start("tests")
     try:
         sample_function_with_a_finally_that_raises_and_catches()
@@ -1041,10 +1012,8 @@ def sample_function_that_catches_and_returns():
 
 
 def test_records_raised_false_when_a_call_catches_its_own_exception_and_returns_a_value():
-    # "exception" fires for this frame too (it saw the exception even though
-    # it went on to handle it), but an explicit non-None return afterward is
-    # unambiguous proof it didn't propagate - the exception flag alone would
-    # have gotten this wrong.
+    # "exception" fires here too, but a non-None return afterward is
+    # unambiguous proof it didn't propagate.
     tracer.start("tests")
     sample_function_that_catches_and_returns()
     calls = tracer.stop()
@@ -1061,10 +1030,8 @@ def sample_function_that_catches_and_implicitly_returns_none():
 
 
 def test_records_raised_true_when_a_call_catches_its_own_exception_and_implicitly_returns_none():
-    # A known, accepted false positive: "return" alone can't tell this
-    # apart from a real propagating exception (both are event="return",
-    # arg=None), and this frame did see an "exception" event. Documented
-    # tradeoff, not a bug - see _make_local_tracer.
+    # Known, accepted false positive: return arg=None can't be told apart
+    # from a real propagating exception. See _make_local_tracer.
     tracer.start("tests")
     sample_function_that_catches_and_implicitly_returns_none()
     calls = tracer.stop()
@@ -1130,9 +1097,7 @@ def test_records_each_generator_resumes_yielded_value_as_its_own_return_value():
     calls = tracer.stop()
 
     generator_calls = [c for c in calls if "sample_generator" in c["qualname"]]
-    # First two resumes: each yield is that resume's own return value. Final
-    # resume: no "exception" event fires for the internal StopIteration used
-    # to signal exhaustion (verified empirically), so it comes out as a
-    # plain, unraised return of None - no special-casing needed for it.
+    # No "exception" event fires for the internal StopIteration that
+    # signals exhaustion, so the final resume is a plain unraised None return.
     assert [c["return_value"] for c in generator_calls] == [1, 2, None]
     assert all(c["raised"] is False for c in generator_calls)
