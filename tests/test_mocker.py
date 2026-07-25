@@ -18,9 +18,11 @@ def _trace(tmp_path, program_source, filename="program.py"):
 
 
 def _exception_reference(call):
-    # Only builtins are exercised here - the full module/alias-aware
-    # reference (matching generator.py's own) is wired in once mocker.py is
-    # actually plugged into generate() (M4).
+    # A simplified stand-in for these unit-level tests, which exercise
+    # mocker.py's rendering functions directly - only builtins are needed
+    # here. generate() itself reuses generator.py's own full module/alias-
+    # aware _exception_reference (see tests/test_generator.py's mocking
+    # tests for that path).
     assert call["exception_module"] == "builtins"
     return call["exception_type"]
 
@@ -39,8 +41,9 @@ def _outer_and_inner_calls(trace_path):
 
 
 def _render_mocked_test(tmp_path, statement, body_lines):
-    # Hand-assembled the same way generate() will eventually do it (M4) -
-    # mocker.py itself only renders the patch statement, not a whole file.
+    # Hand-assembled the same way generate() itself does it (see
+    # generator.py's _render_test_module) - mocker.py itself only renders
+    # the patch statement, not a whole file.
     lines = [
         "import sys",
         mocker.render_import_line(),
