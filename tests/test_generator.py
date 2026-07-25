@@ -1695,6 +1695,140 @@ def test_generates_a_passing_raises_test_for_an_entry_script_exception(tmp_path)
     assert "1 passed" in result.stdout
 
 
+def _call(call_id=0, parent_call_id=None, module="helper", qualname="f", **overrides):
+    call = {
+        "call_id": call_id,
+        "parent_call_id": parent_call_id,
+        "module": module,
+        "qualname": qualname,
+        "args": {},
+        "arg_serialization": {},
+        "raised": False,
+        "return_value": 1,
+        "return_serialization": "json",
+        "exception_module": None,
+        "exception_type": None,
+    }
+    call.update(overrides)
+    return call
+
+
+def test_children_by_call_id_groups_direct_children_only():
+    root = _call(call_id=0)
+    child = _call(call_id=1, parent_call_id=0)
+    grandchild = _call(call_id=2, parent_call_id=1)
+
+    children = generator._children_by_call_id([root, child, grandchild])
+
+    assert children[0] == [child]
+    assert children[1] == [grandchild]
+    assert 2 not in children
+
+
+def test_mock_skip_reason_accepts_a_plain_returning_call():
+    call = _call(return_value=42, return_serialization="json")
+    assert generator._mock_skip_reason(call, module_cache={}) is None
+
+
+def test_mock_skip_reason_ignores_the_childs_own_unserializable_args():
+    # Mocking replaces the whole call, so what it was passed never matters -
+    # only a real replayed call needs its arguments to be JSON-safe.
+    call = _call(args={"x": "<Widget>"}, arg_serialization={"x": "repr"})
+    assert generator._mock_skip_reason(call, module_cache={}) is None
+
+
+def test_mock_skip_reason_rejects_a_repr_only_return_value():
+    call = _call(return_value="<Widget>", return_serialization="repr")
+    reason = generator._mock_skip_reason(call, module_cache={})
+    assert "could not be captured as a JSON value" in reason
+
+
+def test_mock_skip_reason_rejects_an_array_return_value():
+    call = _call(return_value=[1, 2], return_serialization="json")
+    reason = generator._mock_skip_reason(call, module_cache={})
+    assert "return value contains a list/array" in reason
+
+
+def test_mock_skip_reason_rejects_an_unfinished_call():
+    call = _call()
+    del call["raised"]
+    reason = generator._mock_skip_reason(call, module_cache={})
+    assert "didn't finish before tracing stopped" in reason
+
+
+def test_mock_skip_reason_rejects_a_method_qualname():
+    call = _call(qualname="Greeter.greet")
+    reason = generator._mock_skip_reason(call, module_cache={})
+    assert "not a plain top-level function" in reason
+
+
+def test_mock_skip_reason_rejects_an_invalid_module_name():
+    call = _call(module="class")
+    reason = generator._mock_skip_reason(call, module_cache={})
+    assert "not a valid import target" in reason
+
+
+def test_mock_skip_reason_accepts_a_raised_builtin_exception():
+    call = _call(
+        raised=True,
+        return_value=None,
+        return_serialization=None,
+        exception_module="builtins",
+        exception_type="ValueError",
+    )
+    assert generator._mock_skip_reason(call, module_cache={}) is None
+
+
+def test_mock_skip_reason_rejects_a_raised_exception_from_an_unimportable_module():
+    call = _call(
+        raised=True,
+        return_value=None,
+        return_serialization=None,
+        exception_module="mymod",
+        exception_type="AppError",
+    )
+    # A pre-populated None entry stands in for an exception module that
+    # fails to import, without needing a real unimportable file on disk.
+    reason = generator._mock_skip_reason(call, module_cache={"mymod": None})
+    assert "could not be imported" in reason
+
+
+def test_unmockable_child_reason_is_none_with_no_children():
+    call = _call(call_id=0)
+    assert generator._unmockable_child_reason(call, {}, module_cache={}) is None
+
+
+def test_unmockable_child_reason_is_none_when_every_child_is_mockable():
+    call = _call(call_id=0)
+    children_by_call_id = {
+        0: [
+            _call(call_id=1, parent_call_id=0, qualname="a"),
+            _call(call_id=2, parent_call_id=0, qualname="b"),
+        ]
+    }
+    assert (
+        generator._unmockable_child_reason(call, children_by_call_id, module_cache={})
+        is None
+    )
+
+
+def test_unmockable_child_reason_reports_the_first_unmockable_child():
+    call = _call(call_id=0)
+    bad_child = _call(
+        call_id=1,
+        parent_call_id=0,
+        qualname="bad",
+        return_value="<Widget>",
+        return_serialization="repr",
+    )
+    children_by_call_id = {0: [bad_child]}
+
+    reason = generator._unmockable_child_reason(call, children_by_call_id, module_cache={})
+
+    assert "child call helper.bad can't be mocked" in reason
+    assert "could not be captured as a JSON value" in reason
+
+
 def test_skips_an_entry_script_exception_raised_by_a_helper_module_function(
     tmp_path, capsys
 ):
