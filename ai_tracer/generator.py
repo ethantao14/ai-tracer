@@ -1,5 +1,6 @@
 import builtins
 import importlib
+import importlib.util
 import inspect
 import json
 import keyword
@@ -70,9 +71,13 @@ def _local_module_names(target_dir):
     return names
 
 
-def generate(trace_log_path, target_dir, output_dir="generated_tests"):
+def generate(
+    trace_log_path, target_dir, output_dir="generated_tests", entry_script=None
+):
     calls = json.loads(Path(trace_log_path).read_text())
     target_dir = str(Path(target_dir).resolve())
+    if entry_script is not None:
+        entry_script = str(Path(entry_script).resolve())
     # Resolved before importing target code: a module that chdir()s at
     # import time would otherwise send a relative output_dir there instead.
     output_path = Path(output_dir).resolve()
@@ -96,6 +101,8 @@ def generate(trace_log_path, target_dir, output_dir="generated_tests"):
         if name.split(".")[0] in local_names:
             sys.modules.pop(name, None)
     try:
+        if entry_script is not None:
+            module_cache["__main__"] = _load_entry_module(entry_script)
         for call in calls:
             reason = _skip_reason(call, module_cache, signature_cache)
             if reason is None:
@@ -153,7 +160,9 @@ def generate(trace_log_path, target_dir, output_dir="generated_tests"):
         used_names[file_name] = module_name
         test_path = output_path / file_name
         test_path.write_text(
-            _render_test_module(module_name, calls_by_module[module_name], target_dir)
+            _render_test_module(
+                module_name, calls_by_module[module_name], target_dir, entry_script
+            )
         )
         written_paths.append(test_path)
 
@@ -164,10 +173,10 @@ def _skip_reason(call, module_cache, signature_cache):
     # None if the call can be generated, else a reason printed to stderr.
     if not call["qualname"].isidentifier():
         return "not a plain top-level function (method, nested function, or lambda)"
-    # "__main__" always names the entry script, but this process can't
-    # re-import that to mean "the traced script" - needs its real file path.
-    if call["module"] == "__main__":
-        return "the entry script's own functions aren't generatable yet (module \"__main__\" has no real import path)"
+    # "__main__" can only be resolved to the traced script if generate()
+    # was given its file path (module_cache is pre-populated in that case).
+    if call["module"] == "__main__" and "__main__" not in module_cache:
+        return "the entry script's own functions need its file path (trace and generate together to get this)"
     # A target can rebind __name__ to a non-string; guard before treating
     # module as a dotted string.
     if not isinstance(call["module"], str) or not all(
@@ -257,6 +266,22 @@ def _get_module(module_name, module_cache):
     return module_cache[module_name]
 
 
+def _load_entry_module(entry_script):
+    # Loaded under a synthetic name, never "__main__": the entry script's
+    # own `if __name__ == "__main__":` guard must not re-run here.
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_ai_tracer_entry_script", entry_script
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except KeyboardInterrupt:
+        raise
+    except BaseException:  # noqa: BLE001 - target import can raise anything
+        return None
+    return module
+
+
 def _get_signature(module_name, qualname, module_cache, signature_cache):
     # Current inspect.Signature for a generatable function, or None if it no
     # longer exists, can't be introspected, or uses an unreplayable
@@ -318,7 +343,7 @@ def _render_conftest(target_dir):
     return "\n".join(lines) + "\n"
 
 
-def _render_test_module(module_name, module_calls, target_dir):
+def _render_test_module(module_name, module_calls, target_dir, entry_script=None):
     imported_names = sorted({call["qualname"] for call in module_calls})
     # Avoids colliding with a traced function named `result`, which would
     # otherwise turn `result = result(...)` into an UnboundLocalError.
@@ -345,6 +370,10 @@ def _render_test_module(module_name, module_calls, target_dir):
 
     pytest_alias = _reserve("_raises_pytest") if has_raises else None
     builtins_alias = _reserve("_raises_builtins") if has_builtin_raises else None
+    is_entry_script = module_name == "__main__"
+    entry_util_alias = _reserve("_importlib_util") if is_entry_script else None
+    entry_spec_var = _reserve("_entry_spec") if is_entry_script else None
+    entry_module_var = _reserve("_entry_module") if is_entry_script else None
     exception_modules = sorted(
         {
             call["exception_module"]
@@ -364,10 +393,26 @@ def _render_test_module(module_name, module_calls, target_dir):
         lines.append(f"import pytest as {pytest_alias}")
     if has_builtin_raises:
         lines.append(f"import builtins as {builtins_alias}")
+    if is_entry_script:
+        lines.append(f"import importlib.util as {entry_util_alias}")
     lines += ["", f"sys.path.insert(0, {target_dir!r})"]
-    # Imported before any exception module - see the circular-import note
-    # in _skip_reason above.
-    lines.append(f"from {module_name} import {', '.join(imported_names)}")
+    if is_entry_script:
+        # Loaded under a synthetic name, not "__main__", so the entry
+        # script's own `if __name__ == "__main__":` guard doesn't re-run.
+        lines.append(
+            f"{entry_spec_var} = {entry_util_alias}.spec_from_file_location("
+            f'"_ai_tracer_entry_script", {entry_script!r})'
+        )
+        lines.append(
+            f"{entry_module_var} = {entry_util_alias}.module_from_spec({entry_spec_var})"
+        )
+        lines.append(f"{entry_spec_var}.loader.exec_module({entry_module_var})")
+        for name in imported_names:
+            lines.append(f"{name} = {entry_module_var}.{name}")
+    else:
+        # Imported before any exception module - see the circular-import
+        # note in _skip_reason above.
+        lines.append(f"from {module_name} import {', '.join(imported_names)}")
     for exception_module in exception_modules:
         lines.append(
             f"import {exception_module} as {exception_aliases[exception_module]}"
@@ -401,15 +446,17 @@ def _exception_reference(call, builtins_alias, exception_aliases):
 
 def main():
     argv = sys.argv[1:]
-    if len(argv) not in (2, 3):
+    if len(argv) not in (2, 3, 4):
         print(
-            "usage: python -m ai_tracer.generator <trace_log> <target_dir> [output_dir]",
+            "usage: python -m ai_tracer.generator <trace_log> <target_dir> "
+            "[output_dir] [entry_script]",
             file=sys.stderr,
         )
         sys.exit(1)
     trace_log_path, target_dir, *rest = argv
-    output_dir = rest[0] if rest else "generated_tests"
-    for path in generate(trace_log_path, target_dir, output_dir):
+    output_dir = rest[0] if len(rest) > 0 else "generated_tests"
+    entry_script = rest[1] if len(rest) > 1 else None
+    for path in generate(trace_log_path, target_dir, output_dir, entry_script):
         print(path)
 
 

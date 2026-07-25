@@ -55,7 +55,10 @@ def test_generates_a_test_that_actually_passes_for_a_simple_function(tmp_path):
     assert "1 passed" in result.stdout
 
 
-def test_skips_the_entry_scripts_own_functions(tmp_path, capsys):
+def test_skips_the_entry_scripts_own_functions_without_an_entry_script_path(
+    tmp_path, capsys
+):
+    # Without entry_script, generate() has no way to import "__main__".
     trace_path = _trace(
         tmp_path,
         'def main():\n    return 1\n\n\nif __name__ == "__main__":\n    main()\n',
@@ -66,7 +69,7 @@ def test_skips_the_entry_scripts_own_functions(tmp_path, capsys):
     )
 
     assert written == []
-    assert '"__main__"' in capsys.readouterr().err
+    assert "its file path" in capsys.readouterr().err
     assert not (tmp_path / "generated_tests" / "test___main__.py").exists()
 
 
@@ -1519,3 +1522,67 @@ def test_a_stale_sys_modules_entry_from_an_earlier_generate_call_is_not_reused(
     second_source = (second_dir / "out" / "test_helper.py").read_text()
     assert "assert result == 'first'" in first_source
     assert "assert result == 'second'" in second_source
+
+
+def test_generates_a_passing_test_for_the_entry_scripts_own_function(tmp_path):
+    program_source = (
+        "def add(a, b):\n"
+        "    return a + b\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    add(2, 3)\n"
+    )
+    trace_path = _trace(tmp_path, program_source)
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(
+        str(trace_path),
+        str(tmp_path),
+        str(output_dir),
+        entry_script=str(tmp_path / "program.py"),
+    )
+
+    assert written == [output_dir / "test___main__.py"]
+    source = (output_dir / "test___main__.py").read_text()
+    assert "spec_from_file_location" in source
+    assert "add(a=2, b=3)" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_entry_script_reload_does_not_re_trigger_its_own_main_guard(tmp_path):
+    marker = tmp_path / "guard_runs.txt"
+    program_source = (
+        "from pathlib import Path\n"
+        "\n"
+        "\n"
+        "def add(a, b):\n"
+        "    return a + b\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        f"    marker = Path({str(marker)!r})\n"
+        "    marker.write_text(marker.read_text() + 'x' if marker.exists() else 'x')\n"
+        "    add(2, 3)\n"
+    )
+    # _trace() runs the CLI, which now generates automatically too - if the
+    # guard reran during that, marker would already read "xx" here.
+    trace_path = _trace(tmp_path, program_source)
+    assert marker.read_text() == "x"
+
+    generator.generate(
+        str(trace_path),
+        str(tmp_path),
+        str(tmp_path / "generated_tests"),
+        entry_script=str(tmp_path / "program.py"),
+    )
+
+    assert marker.read_text() == "x"
