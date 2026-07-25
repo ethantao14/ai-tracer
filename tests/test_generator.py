@@ -1622,6 +1622,40 @@ def test_entry_script_function_reading_dunder_name_still_generates_correctly(
     assert "1 passed" in result.stdout
 
 
+def test_entry_script_function_depending_on_dunder_module_is_a_known_limitation(
+    tmp_path,
+):
+    # Documented limitation: a function's own __module__ is baked in at
+    # definition time from the synthetic name used to load the entry
+    # script, not patched back like the bare __name__ global is.
+    program_source = (
+        "def where():\n"
+        "    return where.__module__\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    where()\n"
+    )
+    trace_path = _trace(tmp_path, program_source)
+
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(
+        str(trace_path),
+        str(tmp_path),
+        str(output_dir),
+        entry_script=str(tmp_path / "program.py"),
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "1 failed" in result.stdout
+
+
 def test_generates_a_passing_raises_test_for_an_entry_script_exception(tmp_path):
     program_source = (
         "class AppError(Exception):\n"
