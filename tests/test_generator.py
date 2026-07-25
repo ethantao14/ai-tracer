@@ -1865,3 +1865,224 @@ def test_skips_an_entry_script_exception_raised_by_a_helper_module_function(
     assert "can only be named when the raising function is also" in (
         capsys.readouterr().err
     )
+
+
+def test_generated_test_mocks_a_direct_child_and_still_passes_when_it_is_broken(
+    tmp_path,
+):
+    # The actual point of M4: prove the default generate() pipeline mocks a
+    # function under test's own children, so the generated test still
+    # passes even when the real child would now behave differently.
+    (tmp_path / "util.py").write_text("def inner(x):\n    return x + 1\n")
+    (tmp_path / "helper.py").write_text(
+        "from util import inner\n\n\ndef outer(x):\n    return inner(x) * 10\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import outer\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    outer(4)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    test_helper_path = output_dir / "test_helper.py"
+    assert test_helper_path in written
+    source = test_helper_path.read_text()
+    assert "from unittest import mock" in source
+    assert "mock.patch('helper.inner', return_value=5) as" in source
+
+    # Break inner() for real, after tracing - the generated test can only
+    # keep passing if it never actually calls this. (test_util.py, which
+    # calls the real inner() directly and isn't the point of this test, is
+    # left out of the run - it's expected to start failing once inner() is
+    # broken.)
+    (tmp_path / "util.py").write_text(
+        "def inner(x):\n    raise RuntimeError('the real inner ran')\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(test_helper_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_skips_a_call_whose_direct_child_is_unmockable(tmp_path, capsys):
+    (tmp_path / "util.py").write_text(
+        "class Widget:\n    pass\n\n\ndef inner():\n    return Widget()\n"
+    )
+    (tmp_path / "helper.py").write_text(
+        "from util import inner\n\n\ndef outer():\n    inner()\n    return 1\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import outer\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    outer()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    written = generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert written == []
+    err = capsys.readouterr().err
+    assert "child call util.inner can't be mocked" in err
+    assert "could not be captured as a JSON value" in err
+
+
+def test_generated_test_mocks_multiple_and_repeated_children(tmp_path):
+    (tmp_path / "util.py").write_text(
+        "def inner(x):\n    return x + 1\n\n\ndef extra(x):\n    return x * 2\n"
+    )
+    (tmp_path / "helper.py").write_text(
+        "from util import inner, extra\n"
+        "\n"
+        "\n"
+        "def outer(a, b):\n"
+        "    return inner(a) + inner(b) + extra(a)\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import outer\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    outer(4, 10)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    test_helper_path = output_dir / "test_helper.py"
+    assert test_helper_path in written
+    source = test_helper_path.read_text()
+    assert "mock.patch('helper.inner', side_effect=[5, 11]) as" in source
+    assert "mock.patch('helper.extra', return_value=8) as" in source
+
+    (tmp_path / "util.py").write_text(
+        "def inner(x):\n    raise RuntimeError('the real inner ran')\n\n\n"
+        "def extra(x):\n    raise RuntimeError('the real extra ran')\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(test_helper_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_generated_test_mocks_a_raised_child_with_a_target_exception(tmp_path):
+    (tmp_path / "errors.py").write_text("class AppError(Exception):\n    pass\n")
+    (tmp_path / "util.py").write_text(
+        "from errors import AppError\n\n\ndef inner():\n    raise AppError('boom')\n"
+    )
+    (tmp_path / "helper.py").write_text(
+        "from util import inner\n"
+        "\n"
+        "\n"
+        "def outer():\n"
+        "    try:\n"
+        "        inner()\n"
+        "    except Exception:\n"
+        "        return -1\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import outer\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    outer()\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    test_helper_path = output_dir / "test_helper.py"
+    assert test_helper_path in written
+    source = test_helper_path.read_text()
+    assert "side_effect=_raises_errors.AppError" in source
+
+    (tmp_path / "util.py").write_text(
+        "def inner():\n    raise RuntimeError('the real inner ran')\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(test_helper_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_generated_test_mocks_an_entry_scripts_own_child_function(tmp_path):
+    # The entry-script case is special: "__main__" as a mock target string
+    # would resolve to whatever this pytest process's own entry point is,
+    # not the reloaded copy - proves that's wired around correctly too.
+    program_source = (
+        "def inner(x):\n"
+        "    return x + 1\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    return inner(4) * 10\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+    trace_path = _trace(tmp_path, program_source)
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(
+        str(trace_path),
+        str(tmp_path),
+        str(output_dir),
+        entry_script=str(tmp_path / "program.py"),
+    )
+
+    assert written == [output_dir / "test___main__.py"]
+    source = (output_dir / "test___main__.py").read_text()
+    assert "mock.patch('_ai_tracer_entry_script.inner', return_value=5) as" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    # main()'s test mocks inner() away, and inner() also gets its own
+    # unmocked test from being directly traced - both pass.
+    assert "2 passed" in result.stdout
