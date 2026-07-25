@@ -756,3 +756,76 @@ def test_cli_trace_includes_return_values_and_raised_status(tmp_path):
     # test_tracer.py's ambiguity tests).
     assert by_qualname["main"]["raised"] is False
     assert by_qualname["main"]["return_value"] == "done"
+
+
+def test_cli_generates_passing_tests_by_default_including_for_the_entry_script(
+    tmp_path,
+):
+    (tmp_path / "helper.py").write_text("def double(x):\n    return x * 2\n")
+    (tmp_path / "program.py").write_text(
+        "from helper import double\n"
+        "\n"
+        "\n"
+        "def add(a, b):\n"
+        "    return a + b\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    double(21)\n"
+        "    add(2, 3)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(tmp_path / "program.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    output_dir = tmp_path / "generated_tests"
+    assert (output_dir / "test_helper.py").exists()
+    assert (output_dir / "test___main__.py").exists()
+
+    pytest_result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert pytest_result.returncode == 0, pytest_result.stdout + pytest_result.stderr
+    # helper.double, plus the entry script's own add and main.
+    assert "3 passed" in pytest_result.stdout
+
+
+def test_cli_still_generates_tests_from_the_partial_trace_when_the_target_crashes(
+    tmp_path,
+):
+    (tmp_path / "helper.py").write_text("def add(a, b):\n    return a + b\n")
+    (tmp_path / "program.py").write_text(
+        "from helper import add\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    add(2, 3)\n"
+        "    raise RuntimeError('boom')\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ai_tracer.cli", str(tmp_path / "program.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "RuntimeError: boom" in result.stderr
+    assert (tmp_path / "generated_tests" / "test_helper.py").exists()

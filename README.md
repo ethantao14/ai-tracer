@@ -2,7 +2,7 @@
 
 **Eventually:** automatically generate pytest test cases by recording the real input/output of every function in a running Python program.
 
-**Right now:** ai-tracer runs an arbitrary external Python program through its own CLI, correctly (imports from sibling files in the target work, and the target doesn't see ai-tracer's own command-line arguments), and records which functions it calls along the way, along with the arguments each call received, what it returned (or that it raised instead), which function called which, and which module each call happened in. From that recording it can generate a pytest test per recorded call - asserting the return value, or `pytest.raises` for the exception it raised - for the calls it can reconstruct safely (see "Generating tests" below). Tracing and generation are two separate steps for now; a single-command flow that does both comes later.
+**Right now:** ai-tracer runs an arbitrary external Python program through its own CLI, correctly (imports from sibling files in the target work, and the target doesn't see ai-tracer's own command-line arguments), and records which functions it calls along the way, along with the arguments each call received, what it returned (or that it raised instead), which function called which, and which module each call happened in. From that recording it generates a pytest test per recorded call - asserting the return value, or `pytest.raises` for the exception it raised - for the calls it can reconstruct safely (see "Generating tests" below). Tracing and generation happen together by default (one command does both); each step can still be run on its own if you want to regenerate from an existing trace without re-running the program.
 
 ---
 
@@ -24,7 +24,7 @@ pip install -e ".[dev]"
 ./scripts/run.sh path/to/your_program.py
 ```
 
-This runs the target program the same way `python path/to/your_program.py` would, just through ai-tracer's own harness.
+This runs the target program the same way `python path/to/your_program.py` would, just through ai-tracer's own harness, and by default also generates pytest tests from what it recorded (see "Generating tests" below) into `generated_tests/` next to the program - the same as running `./scripts/generate.sh` yourself afterward. This still happens even if the program crashes, from whatever it recorded before the crash.
 
 Any extra arguments are forwarded to the target program:
 
@@ -55,13 +55,13 @@ When `raised` is `true`, `exception_type` and `exception_module` name the except
 
 ## Generating tests
 
-Once you have a trace log, turn it into pytest test files:
+`./scripts/run.sh` above already does this by default. To regenerate from an existing trace log without re-running the program (e.g. after editing the target's code):
 
 ```bash
-./scripts/generate.sh path/to/your_program.trace.json path/to/target_dir generated_tests
+./scripts/generate.sh path/to/your_program.trace.json path/to/target_dir generated_tests path/to/your_program.py
 ```
 
-The arguments are the trace log, the target program's own directory (the same directory the traced program lives in, used to import the functions under test), and an output directory for the generated tests (defaults to `generated_tests/`).
+The arguments are the trace log, the target program's own directory (the same directory the traced program lives in, used to import the functions under test), an output directory for the generated tests (defaults to `generated_tests/`), and optionally the entry script's own path - passing it is what makes the entry script's own functions generatable (see the `"__main__"` skip reason below); `./scripts/run.sh` always passes this automatically.
 
 This writes one `test_<module>.py` file per module, with one test per recorded call. A call that returned normally replays the exact arguments and asserts the exact return value; a call that raised replays the arguments inside `pytest.raises(...)` for the exact exception it raised:
 
@@ -100,12 +100,12 @@ Not every recorded call becomes a test. A call is skipped, with a one-line reaso
 - It isn't a plain top-level function (a method, nested function, or lambda). Only module-level functions are importable by name.
 - Any of its arguments, or its return value, fell back to `repr()` rather than a real JSON value (`arg_serialization`/`return_serialization` is `"repr"`) - a `repr()` string isn't a reconstructable literal.
 - Any of its arguments, or its return value, contains a list/array. JSON has no tuple type, so the tracer records both lists and tuples as arrays, and the two can't be told apart from the trace alone. Reconstructing a tuple as a list would produce a failing assertion (`(1, 2) == [1, 2]` is `False`), so these are skipped for now rather than generate a test that fails. This is the biggest current limitation, since `return a, b` is a tuple; preserving container type in the trace would lift it.
-- It raised an exception whose type can't be named in the generated test: not a plain identifier, not an importable module (a built-in that isn't really built-in, or an exception defined in the entry script's `__main__`), or a type that module no longer has.
+- It raised an exception whose type can't be named in the generated test: not a plain identifier, not an importable module (a built-in that isn't really built-in, or one defined in the entry script's `__main__` when no entry script path was given, or when the raising function and the exception aren't defined in the same module), or a type that module no longer has.
 - It's an `async`, generator, or async-generator function. Calling one synchronously returns a coroutine or generator object, not the value the tracer recorded when it was awaited or resumed, so a plain `result = f(...)` assertion could never match.
 - Its module name isn't a valid Python import target (e.g. a file named `class.py`), or the module can't be imported now (importing re-runs its top-level code, which may raise).
 - Its signature can't be replayed with plain keyword arguments (positional-only parameters, `*args`, or `**kwargs`), or the function no longer exists in the module.
 - Its recorded arguments no longer bind to the function's current signature (a parameter was renamed, removed, or a new required one was added since it was traced), which would make the generated call fail outright.
-- It belongs to the entry script (module `"__main__"`). A bare trace log doesn't carry the entry script's file path, so its own functions can't be imported by name yet - this is lifted once tracing and generation share a single command.
+- It belongs to the entry script (module `"__main__"`) and no entry script path was given. A bare trace log doesn't carry the entry script's file path by itself, so its own functions can only be imported by name when that path is passed in - `./scripts/run.sh` does this automatically; regenerating standalone needs the optional fourth argument to `./scripts/generate.sh`.
 
 **Known limitation (default arguments):** the trace records every parameter present in the call frame, including ones the caller left at their default, and can't tell an omitted argument from one passed explicitly. The generated test always passes each recorded argument by keyword. For the overwhelmingly common cases (immutable defaults like `None`, numbers, strings) this is exactly correct. It only misbehaves for a parameter whose default is a JSON-serializable object the function then compares by identity (e.g. `DEFAULT = {}` used as a sentinel via `x is DEFAULT`): the generated call passes a fresh equal object rather than the original default, so an identity check flips. Fixing this properly needs the tracer to record which arguments were passed explicitly, which is out of scope here.
 
@@ -116,6 +116,10 @@ Not every recorded call becomes a test. A call is skipped, with a one-line reaso
 **Known limitation (raised false positive):** the generator trusts the trace's `raised` flag, matching the record-then-generate design (it never re-runs a function to second-guess the recording). But `raised` has a documented false positive: a function that catches its own exception and returns `None` - explicitly or implicitly - is recorded as having raised (see the `raised` note above). For such a call the generator emits a `pytest.raises(...)` test that fails, because replaying the function returns `None` instead of raising. This affects the common defensive pattern `try: return d[k] except KeyError: return None`. Reviewing generated `pytest.raises` tests is worthwhile; a call that catches and returns a non-`None` value is recorded correctly (`raised` is `false`) and generates a normal assertion instead.
 
 **Known limitation (exception attribution):** a generated `pytest.raises(...)` names whichever exception the tracer recorded for the call, which is the escaping one except in the rare case where a `finally` block raises and catches a different exception while the original propagates (see the trace-format note on `exception_type` above). In that case the generated test asserts the wrong exception and would fail.
+
+**Known limitation (entry script re-executes):** generating a test for the entry script's own function loads that script a second time, under a different module name so its `if __name__ == "__main__":` guard doesn't fire again - but any top-level code outside that guard (module-level side effects, not function definitions) runs again anyway, the same as importing any other target module for inspection re-runs its top-level code. This happens automatically every time `./scripts/run.sh` is used, not just when standalone regeneration is a deliberate, separate step.
+
+**Known limitation (entry script module identity):** the generated test patches the reloaded entry script's `__name__` back to `"__main__"` after loading it, so a function that reads the bare `__name__` global still sees what it saw when traced. But every function and class defined while the file executed already has its own `__module__` baked in from the internal name used to load it, and `sys.modules["__main__"]` isn't repointed to this reloaded copy either. A function whose behavior depends on `__module__`, or that looks itself up via `sys.modules[__name__]`, rather than reading the bare `__name__` global, can still generate a test that fails even though the traced call itself returned successfully. Like the argument-identity limitations above, this needs deeper identity tracking that's out of scope here.
 
 **Known limitation (order-dependent shared state):** each generated test asserts that a function, called with the recorded arguments, returns the recorded value - it assumes the function's result depends only on its arguments. A function whose result also depends on shared mutable state, and on the order calls happened in, isn't faithfully captured this way. Calls within one module keep their traced order, but pytest runs one module's tests independently of another's, so a return value that only held because some other module's function ran first can assert a value that no longer matches. This is inherent to turning individual recorded calls into independent tests, not something the generator can reorder its way out of.
 

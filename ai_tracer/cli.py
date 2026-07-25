@@ -3,7 +3,7 @@ import runpy
 import sys
 from pathlib import Path
 
-from ai_tracer import tracer
+from ai_tracer import generator, tracer
 
 
 def _local_module_names(target_dir):
@@ -57,7 +57,19 @@ def main():
         print("usage: ai-tracer <program> [program_args...]", file=sys.stderr)
         sys.exit(1)
     program, *program_args = argv
-    run(program, program_args, restore=False)
+    resolved_path = Path(program).resolve()
+    trace_output = resolved_path.with_suffix(".trace.json")
+    try:
+        run(program, program_args, restore=False, trace_output=trace_output)
+    finally:
+        # Runs even if the target crashed: run() still writes the trace
+        # it collected before the crash, so tests can still be generated.
+        generator.generate(
+            str(trace_output),
+            str(resolved_path.parent),
+            str(resolved_path.parent / "generated_tests"),
+            entry_script=str(resolved_path),
+        )
 
 
 if __name__ == "__main__":

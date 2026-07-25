@@ -55,7 +55,10 @@ def test_generates_a_test_that_actually_passes_for_a_simple_function(tmp_path):
     assert "1 passed" in result.stdout
 
 
-def test_skips_the_entry_scripts_own_functions(tmp_path, capsys):
+def test_skips_the_entry_scripts_own_functions_without_an_entry_script_path(
+    tmp_path, capsys
+):
+    # Without entry_script, generate() has no way to import "__main__".
     trace_path = _trace(
         tmp_path,
         'def main():\n    return 1\n\n\nif __name__ == "__main__":\n    main()\n',
@@ -66,7 +69,7 @@ def test_skips_the_entry_scripts_own_functions(tmp_path, capsys):
     )
 
     assert written == []
-    assert '"__main__"' in capsys.readouterr().err
+    assert "its file path" in capsys.readouterr().err
     assert not (tmp_path / "generated_tests" / "test___main__.py").exists()
 
 
@@ -1519,3 +1522,212 @@ def test_a_stale_sys_modules_entry_from_an_earlier_generate_call_is_not_reused(
     second_source = (second_dir / "out" / "test_helper.py").read_text()
     assert "assert result == 'first'" in first_source
     assert "assert result == 'second'" in second_source
+
+
+def test_generates_a_passing_test_for_the_entry_scripts_own_function(tmp_path):
+    program_source = (
+        "def add(a, b):\n"
+        "    return a + b\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    add(2, 3)\n"
+    )
+    trace_path = _trace(tmp_path, program_source)
+
+    output_dir = tmp_path / "generated_tests"
+    written = generator.generate(
+        str(trace_path),
+        str(tmp_path),
+        str(output_dir),
+        entry_script=str(tmp_path / "program.py"),
+    )
+
+    assert written == [output_dir / "test___main__.py"]
+    source = (output_dir / "test___main__.py").read_text()
+    assert "spec_from_file_location" in source
+    assert "add(a=2, b=3)" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_entry_script_reload_does_not_re_trigger_its_own_main_guard(tmp_path):
+    marker = tmp_path / "guard_runs.txt"
+    program_source = (
+        "from pathlib import Path\n"
+        "\n"
+        "\n"
+        "def add(a, b):\n"
+        "    return a + b\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        f"    marker = Path({str(marker)!r})\n"
+        "    marker.write_text(marker.read_text() + 'x' if marker.exists() else 'x')\n"
+        "    add(2, 3)\n"
+    )
+    # _trace() runs the CLI, which now generates automatically too - if the
+    # guard reran during that, marker would already read "xx" here.
+    trace_path = _trace(tmp_path, program_source)
+    assert marker.read_text() == "x"
+
+    generator.generate(
+        str(trace_path),
+        str(tmp_path),
+        str(tmp_path / "generated_tests"),
+        entry_script=str(tmp_path / "program.py"),
+    )
+
+    assert marker.read_text() == "x"
+
+
+def test_entry_script_function_reading_dunder_name_still_generates_correctly(
+    tmp_path,
+):
+    # The entry script is reloaded under a synthetic name during generation
+    # so its own main guard doesn't refire; __name__ must still read back as
+    # "__main__" afterward, matching what the function saw when traced.
+    program_source = (
+        "def module_name():\n"
+        "    return __name__\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    module_name()\n"
+    )
+    trace_path = _trace(tmp_path, program_source)
+
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(
+        str(trace_path),
+        str(tmp_path),
+        str(output_dir),
+        entry_script=str(tmp_path / "program.py"),
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_entry_script_function_depending_on_dunder_module_is_a_known_limitation(
+    tmp_path,
+):
+    # Documented limitation: a function's own __module__ is baked in at
+    # definition time from the synthetic name used to load the entry
+    # script, not patched back like the bare __name__ global is.
+    program_source = (
+        "def where():\n"
+        "    return where.__module__\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    where()\n"
+    )
+    trace_path = _trace(tmp_path, program_source)
+
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(
+        str(trace_path),
+        str(tmp_path),
+        str(output_dir),
+        entry_script=str(tmp_path / "program.py"),
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "1 failed" in result.stdout
+
+
+def test_generates_a_passing_raises_test_for_an_entry_script_exception(tmp_path):
+    program_source = (
+        "class AppError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def fail():\n"
+        "    raise AppError('boom')\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    try:\n"
+        "        fail()\n"
+        "    except AppError:\n"
+        "        pass\n"
+    )
+    trace_path = _trace(tmp_path, program_source)
+
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(
+        str(trace_path),
+        str(tmp_path),
+        str(output_dir),
+        entry_script=str(tmp_path / "program.py"),
+    )
+
+    source = (output_dir / "test___main__.py").read_text()
+    assert "with _raises_pytest.raises(_entry_module.AppError):" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_skips_an_entry_script_exception_raised_by_a_helper_module_function(
+    tmp_path, capsys
+):
+    # The cross-module case (a helper function raising an exception class
+    # defined in the entry script) stays an unsupported, documented skip
+    # even when entry_script is given - only the same-module case is lifted.
+    (tmp_path / "helper.py").write_text(
+        "def boom():\n    from __main__ import AppError\n    raise AppError('x')\n"
+    )
+    program_source = (
+        "from helper import boom\n"
+        "\n"
+        "\n"
+        "class AppError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    try:\n"
+        "        boom()\n"
+        "    except AppError:\n"
+        "        pass\n"
+    )
+    trace_path = _trace(tmp_path, program_source)
+
+    written = generator.generate(
+        str(trace_path),
+        str(tmp_path),
+        str(tmp_path / "generated_tests"),
+        entry_script=str(tmp_path / "program.py"),
+    )
+
+    assert written == []
+    assert "can only be named when the raising function is also" in (
+        capsys.readouterr().err
+    )
