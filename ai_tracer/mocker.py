@@ -31,15 +31,41 @@ def render_import_line():
     return "from unittest import mock"
 
 
-def mock_target(parent_module, child):
-    return f"{parent_module}.{child['qualname']}"
+def mock_target(parent_module, calls):
+    return f"{parent_module}.{calls[0]['qualname']}"
 
 
-def render_patch_line(parent_module, child, alias):
-    # Happy path only: `child` was called exactly once and returned rather
-    # than raised. Repeated calls and raised children are handled later.
-    target = mock_target(parent_module, child)
-    return (
-        f"with mock.patch({target!r}, return_value={child['return_value']!r}) "
-        f"as {alias}:"
+def _outcome(calls, exception_reference):
+    # A raised call can't be expressed as return_value at all, and a call
+    # made more than once needs its outcomes replayed in traced order - so
+    # only a single, non-raised call gets the plain return_value= form.
+    # (A bare exception class in a side_effect list is enough on its own to
+    # make the mock raise it - unittest.mock instantiates it with no args,
+    # same as pytest.raises(SomeError) names the type, not a message.)
+    if len(calls) == 1 and not calls[0]["raised"]:
+        return f"return_value={calls[0]['return_value']!r}"
+    if len(calls) == 1:
+        return f"side_effect={exception_reference(calls[0])}"
+    literals = ", ".join(
+        exception_reference(call) if call["raised"] else repr(call["return_value"])
+        for call in calls
     )
+    return f"side_effect=[{literals}]"
+
+
+def render_patch_clause(parent_module, calls, alias, exception_reference):
+    # `calls` holds every recorded call to one direct child, in traced call
+    # order - `mock.patch(...) as alias`, with no leading "with" and no
+    # trailing ":", so several children's clauses can share one `with`
+    # statement. `exception_reference(call)` must return a source
+    # expression naming the raised call's exception class (e.g.
+    # "ValueError" or "errors.AppError"); only called for a raised call.
+    target = mock_target(parent_module, calls)
+    return f"mock.patch({target!r}, {_outcome(calls, exception_reference)}) as {alias}"
+
+
+def render_patch_statement(clauses):
+    # One `with clause1, clause2, ...:` line covering every direct child a
+    # function under test needs mocked - each entry in `clauses` comes from
+    # a `render_patch_clause` call for one distinct child target.
+    return "with " + ", ".join(clauses) + ":"
