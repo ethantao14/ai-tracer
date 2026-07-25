@@ -237,13 +237,23 @@ def _exception_skip_reason(call, module_cache):
         if not hasattr(builtins, exception_type):
             return f"exception {exception_type!r} is not a builtin"
         return None
-    # Same limits as a function's own module (see _skip_reason above).
-    if not isinstance(exception_module, str) or exception_module == "__main__":
-        return (
-            f"exception module {exception_module!r} can't be imported "
-            "(the entry script has no real import path, or it isn't a module name)"
-        )
-    if not all(_is_valid_import_name(part) for part in exception_module.split(".")):
+    if exception_module == "__main__":
+        # Only handled when the raising function is also in the entry
+        # script and generate() was given its path - a helper module
+        # referencing an entry-script exception class stays unsupported.
+        if call["module"] != "__main__" or "__main__" not in module_cache:
+            return (
+                "exception module '__main__' can only be named when the "
+                "raising function is also in the entry script and its file "
+                "path was given"
+            )
+        module = module_cache["__main__"]
+        if module is None or not hasattr(module, exception_type):
+            return f"exception __main__.{exception_type} could not be imported"
+        return None
+    if not isinstance(exception_module, str) or not all(
+        _is_valid_import_name(part) for part in exception_module.split(".")
+    ):
         return f"exception module {exception_module!r} is not a valid import target"
     module = _get_module(exception_module, module_cache)
     if module is None or not hasattr(module, exception_type):
@@ -267,14 +277,17 @@ def _get_module(module_name, module_cache):
 
 
 def _load_entry_module(entry_script):
-    # Loaded under a synthetic name, never "__main__": the entry script's
-    # own `if __name__ == "__main__":` guard must not re-run here.
+    # Loaded under a synthetic name so the entry script's own
+    # `if __name__ == "__main__":` guard doesn't refire during exec_module;
+    # patched to the real "__main__" right after, so a function reading
+    # __name__ at call time still sees what it saw when traced.
     try:
         spec = importlib.util.spec_from_file_location(
             "_ai_tracer_entry_script", entry_script
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        module.__name__ = "__main__"
     except KeyboardInterrupt:
         raise
     except BaseException:  # noqa: BLE001 - target import can raise anything
@@ -378,7 +391,11 @@ def _render_test_module(module_name, module_calls, target_dir, entry_script=None
         {
             call["exception_module"]
             for call in module_calls
-            if call["raised"] and call["exception_module"] != "builtins"
+            # "__main__" is referenced through entry_module_var instead of
+            # a plain import (which would import this test process's own
+            # entry point, not the traced script).
+            if call["raised"]
+            and call["exception_module"] not in ("builtins", "__main__")
         }
     )
     exception_aliases = {
@@ -407,6 +424,9 @@ def _render_test_module(module_name, module_calls, target_dir, entry_script=None
             f"{entry_module_var} = {entry_util_alias}.module_from_spec({entry_spec_var})"
         )
         lines.append(f"{entry_spec_var}.loader.exec_module({entry_module_var})")
+        # Patched back to "__main__" after exec so a function reading
+        # __name__ at call time sees what it saw when traced.
+        lines.append(f'{entry_module_var}.__name__ = "__main__"')
         for name in imported_names:
             lines.append(f"{name} = {entry_module_var}.{name}")
     else:
@@ -428,7 +448,9 @@ def _render_test_module(module_name, module_calls, target_dir, entry_script=None
         lines += ["", ""]
         lines.append(f"def test_{qualname}_{index}():")
         if call["raised"]:
-            reference = _exception_reference(call, builtins_alias, exception_aliases)
+            reference = _exception_reference(
+                call, builtins_alias, exception_aliases, entry_module_var
+            )
             lines.append(f"    with {pytest_alias}.raises({reference}):")
             lines.append(f"        {qualname}({args})")
         else:
@@ -438,9 +460,11 @@ def _render_test_module(module_name, module_calls, target_dir, entry_script=None
     return "\n".join(lines) + "\n"
 
 
-def _exception_reference(call, builtins_alias, exception_aliases):
+def _exception_reference(call, builtins_alias, exception_aliases, entry_module_var):
     if call["exception_module"] == "builtins":
         return f"{builtins_alias}.{call['exception_type']}"
+    if call["exception_module"] == "__main__":
+        return f"{entry_module_var}.{call['exception_type']}"
     return f"{exception_aliases[call['exception_module']]}.{call['exception_type']}"
 
 
