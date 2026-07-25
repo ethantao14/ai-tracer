@@ -261,6 +261,59 @@ def _exception_skip_reason(call, module_cache):
     return None
 
 
+def _children_by_call_id(calls):
+    # A call's direct children, keyed by its own call_id. Grouped over every
+    # recorded call, not just generatable ones, so a lookup for any call_id
+    # in the trace resolves correctly regardless of whether that call itself
+    # ended up generatable.
+    children = {}
+    for call in calls:
+        parent_call_id = call["parent_call_id"]
+        if parent_call_id is not None:
+            children.setdefault(parent_call_id, []).append(call)
+    return children
+
+
+def _mock_skip_reason(call, module_cache):
+    # None if `call` is safe to stand in for as a mocked child (its recorded
+    # return value or exception can be reproduced without replaying the real
+    # call), else a reason. Doesn't look at the child's own arguments at all
+    # - mocking replaces the whole call, so what it was passed never matters,
+    # only what it handed back.
+    if not call["qualname"].isidentifier():
+        return "not a plain top-level function (method, nested function, or lambda)"
+    if not isinstance(call["module"], str) or not all(
+        _is_valid_import_name(part) for part in call["module"].split(".")
+    ):
+        return f"module {call['module']!r} is not a valid import target"
+    if "raised" not in call:
+        return (
+            "call didn't finish before tracing stopped (e.g. an unjoined worker thread)"
+        )
+    if call["raised"]:
+        return _exception_skip_reason(call, module_cache)
+    if call["return_serialization"] == "repr":
+        return "return value could not be captured as a JSON value"
+    if _contains_array(call["return_value"]):
+        return "return value contains a list/array (a tuple can't be told apart from a list in the trace yet)"
+    return None
+
+
+def _unmockable_child_reason(call, children_by_call_id, module_cache):
+    # None if every direct child of `call` is a safe mock target, else a
+    # reason naming the first one that isn't. Only direct children matter:
+    # mocking a child replaces its whole body, so anything nested inside it
+    # never runs during the generated test either.
+    for child in children_by_call_id.get(call["call_id"], []):
+        reason = _mock_skip_reason(child, module_cache)
+        if reason is not None:
+            return (
+                f"child call {child['module']}.{child['qualname']} can't be "
+                f"mocked: {reason}"
+            )
+    return None
+
+
 def _get_module(module_name, module_cache):
     # Cached per generate() call so a module referenced by many calls is
     # only imported (and its top-level code only re-run) once.
