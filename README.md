@@ -14,6 +14,49 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
+ai-tracer runs your target program in this same Python process, so if your program imports anything beyond the standard library (e.g. `requests`, `numpy`), install those into this same virtualenv too - `pip install <your-dependency>` with it still active. A target that only imports the standard library, or its own sibling files, needs nothing extra.
+
+---
+
+## Quickstart
+
+A minimal, no-context-needed walkthrough - the whole workflow on a two-file example, before pointing ai-tracer at a real project.
+
+1. Anywhere on your machine (this doesn't need to be inside the ai-tracer repo), make a small folder and put a program in it. For example, `shop.py`:
+
+   ```python
+   def apply_discount(price, percent):
+       return price - (price * percent / 100)
+
+   def total(price, percent):
+       return round(apply_discount(price, percent), 2)
+
+   if __name__ == "__main__":
+       total(100, 10)
+   ```
+
+2. With ai-tracer's virtualenv active (`source path/to/ai-tracer/.venv/bin/activate` - see Installation above), `cd` into that folder and run your program through ai-tracer instead of calling `python` directly:
+
+   ```bash
+   python -m ai_tracer.cli shop.py
+   ```
+
+   This runs `shop.py` exactly the way `python shop.py` would - same output, same behavior - while recording every function it calls along the way.
+
+3. Two new things show up next to it:
+   - `shop.trace.json` - a record of every call: what function, with what arguments, and what it returned (see "Running" below for the full field-by-field reference).
+   - `generated_tests/` - real pytest test files, written from that recording. You didn't write any of these by hand.
+
+4. Run what it wrote:
+
+   ```bash
+   pytest generated_tests/
+   ```
+
+   They pass, because each one just replays a call you already watched happen. `total`'s test even mocks out `apply_discount` inside it (see "Generating tests" below), so it only tests `total` itself, not everything underneath it.
+
+That's the whole loop: run your program once through ai-tracer, get a working test suite for free. Everything past this point is reference material - the exact trace format, the exact generated-test format, and every case ai-tracer intentionally skips rather than risk a wrong test.
+
 ---
 
 ## Running
@@ -22,7 +65,7 @@ pip install -e ".[dev]"
 ./scripts/run.sh path/to/your_program.py
 ```
 
-This runs the target program the same way `python path/to/your_program.py` would, just through ai-tracer's own harness, and by default also generates pytest tests from what it recorded (see "Generating tests" below) into `generated_tests/` next to the program - the same as running `./scripts/generate.sh` yourself afterward. This still happens even if the program crashes, from whatever it recorded before the crash.
+This runs the target program the same way `python path/to/your_program.py` would, just through ai-tracer's own harness, and by default also generates pytest tests from what it recorded (see "Generating tests" below) into `generated_tests/` next to the program - the same as running `./scripts/generate.sh` yourself afterward. This still happens even if the program crashes, from whatever it recorded before the crash. `./scripts/run.sh` is a one-line wrapper around `python -m ai_tracer.cli` (used in the Quickstart above) - the two are interchangeable; `./scripts/run.sh` just assumes you're invoking it from inside the ai-tracer repo (or referencing it by its own path from elsewhere), while `python -m ai_tracer.cli` works from anywhere the virtualenv is active.
 
 Any extra arguments are forwarded to the target program:
 
