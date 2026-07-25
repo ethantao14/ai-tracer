@@ -2,7 +2,7 @@
 
 **Eventually:** automatically generate pytest test cases by recording the real input/output of every function in a running Python program.
 
-**Right now:** ai-tracer runs an arbitrary external Python program through its own CLI, correctly (imports from sibling files in the target work, and the target doesn't see ai-tracer's own command-line arguments), and records which functions it calls along the way, along with the arguments each call received, what it returned (or that it raised instead), which function called which, and which module each call happened in. From that recording it generates a pytest test per recorded call - asserting the return value, or `pytest.raises` for the exception it raised - for the calls it can reconstruct safely (see "Generating tests" below). Tracing and generation happen together by default (one command does both); each step can still be run on its own if you want to regenerate from an existing trace without re-running the program.
+**Right now:** ai-tracer runs an arbitrary external Python program through its own CLI, correctly (imports from sibling files in the target work, and the target doesn't see ai-tracer's own command-line arguments), and records which functions it calls along the way, along with the arguments each call received, what it returned (or that it raised instead), which function called which, and which module each call happened in. From that recording it generates a pytest test per recorded call - asserting the return value, or `pytest.raises` for the exception it raised - for the calls it can reconstruct safely (see "Generating tests" below). A generated test also mocks out any function the call under test directly calls, standing in with its recorded return value or exception, so the test exercises only that one function - not everything it happens to call underneath. Tracing and generation happen together by default (one command does both); each step can still be run on its own if you want to regenerate from an existing trace without re-running the program.
 
 ---
 
@@ -91,6 +91,21 @@ def test_check_0():
 
 A built-in exception is named directly (`ZeroDivisionError`); a target-defined one is imported by its module and named module-qualified (`errors.AppError`), so it can't collide with the function names imported for the tests.
 
+If the call under test itself called other traced functions, those direct calls are mocked out with `unittest.mock`, so the test exercises only the one function - not whatever it happens to call underneath. Say `divide` above actually calls a `round_result` helper before returning:
+
+```python
+from unittest import mock
+
+...
+
+def test_divide_0():
+    with mock.patch('helper.round_result', return_value=5) as _mock_round_result:
+        result = divide(a=10, b=2)
+        assert result == 5
+```
+
+Each distinct child gets its own `mock.patch(...)` clause (several share one `with` line when there's more than one), and a child called more than once gets a `side_effect=` list replaying every recorded outcome in traced order instead of a single `return_value=`; a child that raised is named as its exception class the same way a top-level raised call is, target-defined exceptions imported and aliased alongside the others. A call with no children of its own is left as a plain `result = ...`/`pytest.raises(...)` body, exactly as before.
+
 It also writes a `conftest.py` next to them. That file runs once when pytest starts and clears any target module cached under the same name (a target module shadowing another, or a stale entry from a previous run) so every generated test imports the target's own code. Doing this once, rather than in each test file, keeps a module or package that other target modules import at load time from being re-executed per file. Run the generated tests as their own pytest invocation, e.g. `pytest generated_tests/`.
 
 If a `conftest.py` ai-tracer didn't generate already exists in the output directory, it's left untouched: the generated tests still import the target through their own `sys.path` setup, but the one-time module eviction is skipped (a warning is printed), so a same-named module already cached in that pytest session could shadow the target's. Point the output at an empty directory (the default `generated_tests/`) to get the full setup.
@@ -106,6 +121,9 @@ Not every recorded call becomes a test. A call is skipped, with a one-line reaso
 - Its signature can't be replayed with plain keyword arguments (positional-only parameters, `*args`, or `**kwargs`), or the function no longer exists in the module.
 - Its recorded arguments no longer bind to the function's current signature (a parameter was renamed, removed, or a new required one was added since it was traced), which would make the generated call fail outright.
 - It belongs to the entry script (module `"__main__"`) and no entry script path was given. A bare trace log doesn't carry the entry script's file path by itself, so its own functions can only be imported by name when that path is passed in - `./scripts/run.sh` does this automatically; regenerating standalone needs the optional fourth argument to `./scripts/generate.sh`.
+- One of the functions it directly called (a "child" call) can't be mocked - for any of the same reasons above that would skip that child as a call on its own, except its own arguments never matter (mocking replaces the whole child call, not just part of it). Only direct children matter; whatever a mocked child itself would have called never gets a chance to run either, so it's irrelevant whether that's mockable.
+
+**Known limitation (mock patch target):** a mocked child is patched under the *calling* function's own name for it (e.g. `helper.round_result`), not the module it's actually defined in - the standard "patch where it's looked up" idiom. This assumes the caller reached the child via a plain `from its_module import name`. If the caller instead used `import its_module; its_module.name(...)`, the calling module has no attribute of that name, so `mock.patch()` raises `AttributeError` immediately - the generated test fails visibly rather than silently under-isolating. The one way this goes wrong silently: if the calling module happens to define or import some unrelated attribute under the same name as the child's qualname, while reaching the real child a different way, the mock patches the wrong thing without any error. This is accepted as a rare edge case; patching the child's own defining module instead was considered and rejected because it would require reimporting the calling module after the patch is applied, breaking the "each shared module is imported once per session" design the generated `conftest.py` relies on - and its own failure mode is silent (a stale, unpatched reference just keeps working) rather than loud.
 
 **Known limitation (default arguments):** the trace records every parameter present in the call frame, including ones the caller left at their default, and can't tell an omitted argument from one passed explicitly. The generated test always passes each recorded argument by keyword. For the overwhelmingly common cases (immutable defaults like `None`, numbers, strings) this is exactly correct. It only misbehaves for a parameter whose default is a JSON-serializable object the function then compares by identity (e.g. `DEFAULT = {}` used as a sentinel via `x is DEFAULT`): the generated call passes a fresh equal object rather than the original default, so an identity check flips. Fixing this properly needs the tracer to record which arguments were passed explicitly, which is out of scope here.
 
