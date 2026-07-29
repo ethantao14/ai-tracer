@@ -71,8 +71,16 @@ def _is_importable_package_dir(path):
 
 
 def _local_module_names(target_dir):
-    # "conftest" is excluded: it's pytest's own infrastructure, and evicting
-    # it mid-collection would delete the conftest pytest is importing.
+    # "conftest" and "pytest" are excluded even if the target defines a
+    # same-named file/package: evicting "conftest" mid-collection would
+    # delete the conftest pytest is importing, and evicting "pytest" would
+    # make a generated `import pytest` (used to render pytest.raises(...))
+    # resolve to the target's own module instead of the real package, since
+    # target_dir is on sys.path ahead of everything else by then. Same
+    # tradeoff as "conftest" above: a target that legitimately defines its
+    # own same-named module can't have it freshly re-imported here, since
+    # both names are reserved for pytest's own infrastructure by the time
+    # any of this runs.
     names = set()
     for entry in Path(target_dir).iterdir():
         if entry.is_file() and entry.suffix == ".py":
@@ -80,6 +88,7 @@ def _local_module_names(target_dir):
         elif entry.is_dir() and _is_importable_package_dir(entry):
             names.add(entry.name)
     names.discard("conftest")
+    names.discard("pytest")
     return names
 
 
