@@ -1,12 +1,25 @@
 import inspect
 import itertools
 import math
+import os
 import sys
 import threading
 from pathlib import Path
 
 _SYNTHETIC_FRAME_NAMES = {"<listcomp>", "<dictcomp>", "<setcomp>", "<genexpr>"}
 _JSON_SAFE_SCALAR_TYPES = (str, bool, type(None))
+# Env var *names* that look like they hold a secret; only these get any
+# redaction (exact-match or substring, see _should_redact/start()).
+_SECRET_NAME_MARKERS = (
+    "key", "token", "secret", "password", "pwd", "credential", "auth", "api",
+)
+# Well-known non-secret vars that would otherwise incidentally match a marker
+# above (PWD/OLDPWD via "pwd", SSH_AUTH_SOCK via "auth") - present in nearly
+# every shell session, holding the current directory or an agent socket path,
+# not a credential. Excluded by exact name (case-insensitive) rather than
+# narrowing the markers themselves, which would also miss real vars like
+# DB_PWD or SSH_AUTH_SOCK-style names for genuine secrets.
+_NON_SECRET_NAMES = {"pwd", "oldpwd", "ssh_auth_sock"}
 
 _target_dir = None
 _start_cwd = None
@@ -16,6 +29,10 @@ _previous_trace = None
 _previous_thread_trace = None
 _call_id_counter = itertools.count()
 _thread_local = threading.local()
+_env_values = set()
+_substring_env_values = set()
+_min_env_value_len = 0
+_redaction_flag = threading.local()
 
 
 def _call_stack():
@@ -28,7 +45,36 @@ def _call_stack():
     return stack
 
 
-def _to_json_safe(value):
+def _should_redact(value, *, allow_substring=True):
+    # Fast path: exact match against a known secret-named env value (O(1)
+    # set lookup, no length floor - even a short secret like a 2-char PIN
+    # must be caught). Always active, even for structural metadata: a target
+    # that rebinds __name__ or an exception's __module__/__qualname__ (all
+    # writable attributes) to an env value directly must still have it caught.
+    matched = value in _env_values
+    # Slow path: substring scan, over a length-filtered subset. Skipped for
+    # metadata (allow_substring=False) since that's what causes false-positive
+    # collisions on legitimate short identifiers, e.g. an env var literally
+    # "main" inside "__main__". The length filter here (unlike the exact-match
+    # set above) is deliberate: scanning for a 1-2 char env value as a
+    # substring would flag almost every string, so short values only ever
+    # get exact-match protection, not substring-scan protection.
+    if (
+        not matched
+        and allow_substring
+        and _substring_env_values
+        and len(value) >= _min_env_value_len
+    ):
+        matched = any(env_val in value for env_val in _substring_env_values)
+    if matched:
+        # Read by _snapshot to decide whether the enclosing value is safe to
+        # replay literally (e.g. as a generated test's argument), per-thread
+        # since tracing can run concurrently across threads.
+        _redaction_flag.hit = True
+    return matched
+
+
+def _to_json_safe(value, *, allow_substring=True):
     # Dispatch on the *exact* type, never a subclass: a subclass could
     # override __iter__/keys()/etc. with side effects. Error messages never
     # interpolate the value or type name, since even that can run target code.
@@ -50,31 +96,62 @@ def _to_json_safe(value):
         return value
     # `is` (not `in`, which uses ==) so a custom metaclass __eq__ can't
     # run target code or lie its way past this check.
+    # `allow_substring=False` is for structural metadata (module/qualname/
+    # exception names): exact-match redaction still applies (a target can
+    # rebind __name__ or an exception's __module__/__qualname__ - both
+    # writable attributes - directly to a secret), but substring scanning is
+    # skipped since that's what causes a false-positive collision with a
+    # legitimate short identifier (e.g. an env var literally "main" inside
+    # "__main__"), which would corrupt the record instead of protecting it.
+    if value_type is str and _should_redact(value, allow_substring=allow_substring):
+        return "<redacted:env>"
     if any(value_type is safe_type for safe_type in _JSON_SAFE_SCALAR_TYPES):
         return value
     if value_type is list or value_type is tuple:
-        return [_to_json_safe(item) for item in value]
+        return [_to_json_safe(item, allow_substring=allow_substring) for item in value]
     if value_type is dict:
         result = {}
         for key, item in value.items():
             if type(key) is not str:
                 raise TypeError("non-string dict key")
-            result[key] = _to_json_safe(item)
+            safe_key = (
+                "<redacted:env>"
+                if _should_redact(key, allow_substring=allow_substring)
+                else key
+            )
+            result[safe_key] = _to_json_safe(item, allow_substring=allow_substring)
         return result
     raise TypeError("not a JSON-safe value")
 
 
-def _snapshot(value):
+def _snapshot(value, *, allow_substring=True):
     # The "kind" tag ("json" vs "repr") travels with the value so a consumer
     # can tell a real JSON value apart from a repr() fallback string.
+    _redaction_flag.hit = False
     try:
-        return _to_json_safe(value), "json"
+        safe_value = _to_json_safe(value, allow_substring=allow_substring)
     except Exception:  # noqa: BLE001 - any snapshot failure must not abort the target
         if type(value) is float:
-            return repr(value), "repr"
-        # Could have a target-defined __repr__ with side effects; bypass
-        # every override via the base implementation instead of repr(value).
-        return object.__repr__(value), "repr"
+            fallback = repr(value)
+        else:
+            # Could have a target-defined __repr__ with side effects; bypass
+            # every override via the base implementation instead of repr(value).
+            fallback = object.__repr__(value)
+        # The repr text itself can embed a secret (e.g. a class whose
+        # __module__ was set from an env var: "<secret.C object at 0x...>"),
+        # so it needs the same redaction check as any other stored string.
+        if _should_redact(fallback, allow_substring=allow_substring):
+            return "<redacted:env>", "repr"
+        return fallback, "repr"
+    # A value containing a redaction anywhere (top-level or nested) is no
+    # longer equivalent to what actually ran, so it's tagged "repr" the same
+    # as a non-JSON-safe value: the generator already skips replaying
+    # anything tagged "repr" rather than treating it as a literal to reuse.
+    # (Callers snapshotting metadata like module/exception names discard
+    # this tag entirely, so it has no effect there either way.)
+    if getattr(_redaction_flag, "hit", False):
+        return safe_value, "repr"
+    return safe_value, "json"
 
 
 def _exception_info(exc_type):
@@ -89,8 +166,8 @@ def _exception_info(exc_type):
         qualname = type.__dict__["__qualname__"].__get__(exc_type)
     except Exception:  # noqa: BLE001 - reading a target class attr must never abort
         qualname = None
-    module_value, _ = _snapshot(module)
-    type_value, _ = _snapshot(qualname)
+    module_value, _ = _snapshot(module, allow_substring=False)
+    type_value, _ = _snapshot(qualname, allow_substring=False)
     return module_value, type_value
 
 
@@ -135,12 +212,16 @@ def _trace_calls(frame):
     # f_globals's __name__ is exactly what Python's import machinery
     # already assigned ("pkg" not "pkg.__init__", etc). Snapshotted since a
     # target could rebind its own __name__ to something non-JSON-safe.
-    module, _ = _snapshot(frame.f_globals.get("__name__"))
+    module, _ = _snapshot(frame.f_globals.get("__name__"), allow_substring=False)
+    # co_qualname is baked into the compiled code object, not writable like
+    # __name__/__module__, but a dynamically-named function (built via exec()
+    # or types.FunctionType) could still have it set from a secret directly.
+    qualname, _ = _snapshot(co.co_qualname, allow_substring=False)
     record = {
         "call_id": call_id,
         "parent_call_id": parent_call_id,
         "module": module,
-        "qualname": co.co_qualname,
+        "qualname": qualname,
         "args": args,
         "arg_serialization": arg_serialization,
     }
@@ -221,7 +302,10 @@ def start(target_dir):
         _previous_trace, \
         _previous_thread_trace, \
         _call_id_counter, \
-        _thread_local
+        _thread_local, \
+        _env_values, \
+        _substring_env_values, \
+        _min_env_value_len
     _target_dir = Path(target_dir).resolve()
     _start_cwd = Path.cwd()
     _start_thread = threading.current_thread()
@@ -231,6 +315,31 @@ def start(target_dir):
     # calling thread's view, so a worker's leftover stack from a previous
     # start()/stop() cycle could otherwise leak into this run.
     _thread_local = threading.local()
+    # Snapshot env var values at start time so _should_redact can catch
+    # them in args/return values without intercepting os.environ access.
+    # Both exact-match and substring redaction are restricted to variables
+    # whose *name* looks secret-like: a generic CI-provided var
+    # (GITHUB_JOB=test, GITHUB_REF_NAME=main, RUNNER_OS=Linux) holds a short,
+    # extremely common value that collides constantly with ordinary code -
+    # not just as a substring ("test_tracer"'s own module name contains
+    # "test"), but as an exact match too (a function plainly named `main`,
+    # the single most common Python entry-point name, exactly equals
+    # GITHUB_REF_NAME's value on the default branch). Restricting to
+    # secret-looking names (key/token/secret/password/pwd/credential/
+    # auth/api) keeps redaction scoped to values actually meant to be
+    # sensitive, matching the convention real secrets are named under.
+    _env_values = {
+        value
+        for name, value in os.environ.items()
+        if value
+        and name.lower() not in _NON_SECRET_NAMES
+        and any(marker in name.lower() for marker in _SECRET_NAME_MARKERS)
+    }
+    # Substring scanning additionally requires a length floor: a 1-2 char
+    # value would be a substring of almost every string. Short secrets still
+    # get full exact-match protection via _env_values above.
+    _substring_env_values = {v for v in _env_values if len(v) >= 3}
+    _min_env_value_len = min((len(v) for v in _substring_env_values), default=0)
     _previous_trace = sys.gettrace()
     _previous_thread_trace = threading.gettrace()
     sys.settrace(_dispatch)
