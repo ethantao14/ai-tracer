@@ -204,7 +204,9 @@ def generate(
         from ai_tracer import ai_generator
 
         written_paths.extend(
-            ai_generator.generate_ai_tests(trace_log_path, target_dir, output_dir)
+            ai_generator.generate_ai_tests(
+                trace_log_path, target_dir, output_dir, entry_script=entry_script
+            )
         )
 
     return written_paths
