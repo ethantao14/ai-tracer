@@ -2,8 +2,9 @@ import json
 import os
 import subprocess
 import sys
+from unittest import mock
 
-from ai_tracer import generator
+from ai_tracer import ai_generator, generator
 
 
 def _trace(tmp_path, program_source, filename="program.py"):
@@ -2086,3 +2087,31 @@ def test_generated_test_mocks_an_entry_scripts_own_child_function(tmp_path):
     # main()'s test mocks inner() away, and inner() also gets its own
     # unmocked test from being directly traced - both pass.
     assert "2 passed" in result.stdout
+
+
+def test_generate_with_ai_true_includes_the_ai_test_file_in_the_return_value(
+    tmp_path,
+):
+    (tmp_path / "helper.py").write_text("def add(a, b):\n    return a + b\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import add\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    add(1, 2)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    with mock.patch.object(ai_generator, "_call_llm", return_value="add(a=0, b=0)\n"):
+        written = generator.generate(
+            str(trace_path), str(tmp_path), str(output_dir), ai=True
+        )
+
+    assert output_dir / "test_helper.py" in written
+    assert output_dir / "test_helper_ai.py" in written
+    assert (output_dir / "test_helper_ai.py").exists()

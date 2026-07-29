@@ -7,6 +7,7 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+ai = ["openai>=1.0.0"]
 
 [build-system]
 requires = ["setuptools>=61.0"]

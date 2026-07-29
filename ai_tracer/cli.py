@@ -53,8 +53,12 @@ def run(target_path, program_args=(), restore=True, trace_output=None):
 def main():
     # Not argparse: REMAINDER swallows a leading "--", a plain slice doesn't.
     argv = sys.argv[1:]
+    use_ai = False
+    if argv and argv[0] == "--ai":
+        use_ai = True
+        argv = argv[1:]
     if not argv:
-        print("usage: ai-tracer <program> [program_args...]", file=sys.stderr)
+        print("usage: ai-tracer [--ai] <program> [program_args...]", file=sys.stderr)
         sys.exit(1)
     program, *program_args = argv
     resolved_path = Path(program).resolve()
@@ -69,6 +73,7 @@ def main():
             str(resolved_path.parent),
             str(resolved_path.parent / "generated_tests"),
             entry_script=str(resolved_path),
+            ai=use_ai,
         )
 
 
