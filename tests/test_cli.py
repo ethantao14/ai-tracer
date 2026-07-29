@@ -1,8 +1,9 @@
 import json
 import subprocess
 import sys
+from unittest import mock
 
-from ai_tracer import cli
+from ai_tracer import cli, generator
 
 
 def _only_qualname_and_args(record):
@@ -756,6 +757,32 @@ def test_cli_trace_includes_return_values_and_raised_status(tmp_path):
     # test_tracer.py's ambiguity tests).
     assert by_qualname["main"]["raised"] is False
     assert by_qualname["main"]["return_value"] == "done"
+
+
+def test_cli_forwards_the_ai_flag_to_generate(tmp_path):
+    (tmp_path / "program.py").write_text("x = 1\n")
+
+    with (
+        mock.patch.object(
+            sys, "argv", ["ai-tracer", "--ai", str(tmp_path / "program.py")]
+        ),
+        mock.patch.object(generator, "generate") as mock_generate,
+    ):
+        cli.main()
+
+    assert mock_generate.call_args.kwargs["ai"] is True
+
+
+def test_cli_defaults_the_ai_flag_to_false(tmp_path):
+    (tmp_path / "program.py").write_text("x = 1\n")
+
+    with (
+        mock.patch.object(sys, "argv", ["ai-tracer", str(tmp_path / "program.py")]),
+        mock.patch.object(generator, "generate") as mock_generate,
+    ):
+        cli.main()
+
+    assert mock_generate.call_args.kwargs["ai"] is False
 
 
 def test_cli_generates_passing_tests_by_default_including_for_the_entry_script(

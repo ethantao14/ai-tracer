@@ -45,11 +45,17 @@ def _contains_array(value):
 def _is_generated_file(path):
     # Only the first line is checked, so this stays cheap and can't be
     # fooled by the marker text appearing lower in an unrelated file.
+    # Recognizes ai_generator's marker too (imported lazily to avoid a
+    # circular import at module load time), so a stale test_*_ai.py from a
+    # previous --ai run still gets cleaned up on a run without --ai.
+    from ai_tracer import ai_generator
+
     try:
         with path.open(encoding="utf-8") as fh:
-            return fh.readline().rstrip("\n") == _GENERATED_MARKER
+            first_line = fh.readline().rstrip("\n")
     except (OSError, UnicodeDecodeError):
         return False
+    return first_line in (_GENERATED_MARKER, ai_generator._GENERATED_MARKER)
 
 
 def _would_clobber(path):
@@ -78,7 +84,11 @@ def _local_module_names(target_dir):
 
 
 def generate(
-    trace_log_path, target_dir, output_dir="generated_tests", entry_script=None
+    trace_log_path,
+    target_dir,
+    output_dir="generated_tests",
+    entry_script=None,
+    ai=False,
 ):
     calls = json.loads(Path(trace_log_path).read_text())
     target_dir = str(Path(target_dir).resolve())
@@ -180,6 +190,13 @@ def generate(
             )
         )
         written_paths.append(test_path)
+
+    if ai:
+        from ai_tracer import ai_generator
+
+        written_paths.extend(
+            ai_generator.generate_ai_tests(trace_log_path, target_dir, output_dir)
+        )
 
     return written_paths
 
