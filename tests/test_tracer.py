@@ -1,4 +1,6 @@
+import json
 import math
+import os
 import sys
 import threading
 import time
@@ -742,12 +744,12 @@ def test_return_values_are_attributed_correctly_under_thread_interleaving():
     barrier = threading.Barrier(2)
     original_snapshot = tracer._snapshot
 
-    def rendezvousing_snapshot(value):
+    def rendezvousing_snapshot(value, **kwargs):
         if value == "test_tracer":
             barrier.wait(timeout=2)
             if threading.current_thread().name == "A":
                 time.sleep(0.05)
-        return original_snapshot(value)
+        return original_snapshot(value, **kwargs)
 
     tracer._snapshot = rendezvousing_snapshot
     try:
@@ -1101,3 +1103,338 @@ def test_records_each_generator_resumes_yielded_value_as_its_own_return_value():
     # signals exhaustion, so the final resume is a plain unraised None return.
     assert [c["return_value"] for c in generator_calls] == [1, 2, None]
     assert all(c["raised"] is False for c in generator_calls)
+
+
+def sample_function_taking_a_secret(value):
+    return value
+
+
+def test_redacts_an_env_var_value_passed_as_an_argument():
+    os.environ["AI_TRACER_TEST_SECRET"] = "super-secret-key-12345"
+    try:
+        tracer.start("tests")
+        sample_function_taking_a_secret(os.environ["AI_TRACER_TEST_SECRET"])
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert calls[0]["args"]["value"] == "<redacted:env>"
+
+
+def test_redacts_an_env_var_value_returned_directly():
+    os.environ["AI_TRACER_TEST_SECRET"] = "super-secret-key-12345"
+    try:
+        tracer.start("tests")
+        sample_function_taking_a_secret(os.environ["AI_TRACER_TEST_SECRET"])
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert calls[0]["return_value"] == "<redacted:env>"
+
+
+def sample_function_returning_an_embedded_secret():
+    return f"Authorization: Bearer {os.environ['AI_TRACER_TEST_SECRET']}"
+
+
+def test_redacts_an_env_var_value_embedded_in_a_returned_string():
+    os.environ["AI_TRACER_TEST_SECRET"] = "super-secret-key-12345"
+    try:
+        tracer.start("tests")
+        sample_function_returning_an_embedded_secret()
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert "super-secret-key-12345" not in calls[0]["return_value"]
+    assert calls[0]["return_value"] == "<redacted:env>"
+
+
+def test_secret_never_appears_anywhere_in_the_trace_log():
+    os.environ["AI_TRACER_TEST_SECRET"] = "super-secret-key-12345"
+    try:
+        tracer.start("tests")
+        sample_function_returning_an_embedded_secret()
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    trace_text = json.dumps(calls)
+    assert "super-secret-key-12345" not in trace_text
+
+
+def test_does_not_redact_a_string_that_is_not_an_env_var_value():
+    tracer.start("tests")
+    sample_function_taking_a_secret("not-a-secret")
+    calls = tracer.stop()
+
+    assert calls[0]["args"]["value"] == "not-a-secret"
+
+
+def sample_function_returning_a_dict_with_secrets():
+    return {
+        "secret": os.environ["AI_TRACER_TEST_SECRET"],
+        "safe": "not-a-secret",
+    }
+
+
+def test_redacts_env_var_values_inside_a_returned_dict():
+    os.environ["AI_TRACER_TEST_SECRET"] = "super-secret-key-12345"
+    try:
+        tracer.start("tests")
+        sample_function_returning_a_dict_with_secrets()
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert calls[0]["return_value"]["secret"] == "<redacted:env>"
+    assert calls[0]["return_value"]["safe"] == "not-a-secret"
+
+
+def sample_function_returning_a_dict_keyed_by_a_secret():
+    return {os.environ["AI_TRACER_TEST_SECRET"]: "cached"}
+
+
+def test_redacts_an_env_var_value_used_as_a_dict_key():
+    os.environ["AI_TRACER_TEST_SECRET"] = "super-secret-key-12345"
+    try:
+        tracer.start("tests")
+        sample_function_returning_a_dict_keyed_by_a_secret()
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert calls[0]["return_value"] == {"<redacted:env>": "cached"}
+
+
+def test_redacted_argument_is_tagged_repr_so_it_is_not_replayed_literally():
+    os.environ["AI_TRACER_TEST_SECRET"] = "super-secret-key-12345"
+    try:
+        tracer.start("tests")
+        sample_function_taking_a_secret(os.environ["AI_TRACER_TEST_SECRET"])
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    # A redacted argument is no longer equivalent to what actually ran, so
+    # it must not be tagged "json" (replayable as a literal) - same
+    # "repr means don't replay this" convention the generator already uses.
+    assert calls[0]["arg_serialization"]["value"] == "repr"
+
+
+def test_redacted_return_value_is_tagged_repr_so_it_is_not_replayed_literally():
+    os.environ["AI_TRACER_TEST_SECRET"] = "super-secret-key-12345"
+    try:
+        tracer.start("tests")
+        sample_function_taking_a_secret(os.environ["AI_TRACER_TEST_SECRET"])
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert calls[0]["return_serialization"] == "repr"
+
+
+def test_non_redacted_argument_is_still_tagged_json():
+    tracer.start("tests")
+    sample_function_taking_a_secret("not-a-secret")
+    calls = tracer.stop()
+
+    assert calls[0]["arg_serialization"]["value"] == "json"
+
+
+def test_module_name_is_not_redacted_even_if_it_matches_an_env_var_substring():
+    # "tracer" is a substring of this file's own recorded module name,
+    # "test_tracer" - metadata must survive that collision unredacted, since
+    # the generator needs the real module name to import the function.
+    os.environ["AI_TRACER_TEST_SECRET"] = "tracer"
+    try:
+        tracer.start("tests")
+        sample_function_taking_a_secret("value")
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert calls[0]["module"] == "test_tracer"
+
+
+def test_exception_module_and_type_are_not_redacted_by_an_env_var_substring():
+    os.environ["AI_TRACER_TEST_SECRET"] = "tracer"
+    try:
+        tracer.start("tests")
+        try:
+            sample_function_that_raises_a_custom_exception()
+        except SampleCustomError:
+            pass
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert calls[0]["exception_type"] == "SampleCustomError"
+    assert calls[0]["exception_module"] == "test_tracer"
+
+
+def test_redacts_a_rebound_module_name_that_exactly_matches_an_env_var_value():
+    # __name__ is a writable module global; a target could rebind it to a
+    # secret directly. Exact-match redaction must still catch that case even
+    # though substring scanning is disabled for metadata fields.
+    def sample_function_for_module_redaction_test():
+        pass
+
+    os.environ["AI_TRACER_TEST_SECRET"] = "super-secret-key-12345"
+    original_name = globals()["__name__"]
+    globals()["__name__"] = os.environ["AI_TRACER_TEST_SECRET"]
+    try:
+        tracer.start("tests")
+        sample_function_for_module_redaction_test()
+        calls = tracer.stop()
+    finally:
+        globals()["__name__"] = original_name
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert calls[0]["module"] == "<redacted:env>"
+
+
+def test_redacts_exception_module_and_type_that_exactly_match_an_env_var_value():
+    # __module__/__qualname__ are writable class attributes; a target's
+    # exception class could have either set to a secret directly.
+    os.environ["AI_TRACER_TEST_SECRET"] = "super-secret-key-12345"
+
+    class SecretNamedError(Exception):
+        pass
+
+    SecretNamedError.__module__ = os.environ["AI_TRACER_TEST_SECRET"]
+    SecretNamedError.__qualname__ = os.environ["AI_TRACER_TEST_SECRET"]
+
+    def sample_function_that_raises_a_secret_named_error():
+        raise SecretNamedError()
+
+    try:
+        tracer.start("tests")
+        try:
+            sample_function_that_raises_a_secret_named_error()
+        except SecretNamedError:
+            pass
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert calls[0]["exception_module"] == "<redacted:env>"
+    assert calls[0]["exception_type"] == "<redacted:env>"
+
+
+def test_redacts_a_qualname_that_exactly_matches_an_env_var_value():
+    # co_qualname is baked into the code object at compile time, but a target
+    # could still replace a function's code object (code.replace()) with one
+    # carrying a secret as its qualname.
+    def sample_function_for_qualname_redaction_test():
+        pass
+
+    os.environ["AI_TRACER_TEST_SECRET"] = "super-secret-key-12345"
+    original_code = sample_function_for_qualname_redaction_test.__code__
+    sample_function_for_qualname_redaction_test.__code__ = original_code.replace(
+        co_qualname=os.environ["AI_TRACER_TEST_SECRET"]
+    )
+    try:
+        tracer.start("tests")
+        sample_function_for_qualname_redaction_test()
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert calls[0]["qualname"] == "<redacted:env>"
+
+
+def test_redacts_a_short_env_var_value_used_as_an_exact_argument():
+    # The substring-scan length filter must not also exclude short values
+    # from exact-match redaction: a 2-char secret is still a secret.
+    os.environ["AI_TRACER_TEST_SECRET"] = "42"
+    try:
+        tracer.start("tests")
+        sample_function_taking_a_secret(os.environ["AI_TRACER_TEST_SECRET"])
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert calls[0]["args"]["value"] == "<redacted:env>"
+
+
+def test_redacts_a_secret_embedded_in_a_repr_fallback_string():
+    # A non-JSON-safe object falls back to object.__repr__(), which embeds
+    # the class's __module__ - a writable attribute a target could set from
+    # a secret directly, e.g. "<super-secret-key.SomeClass object at 0x...>".
+    class SampleUnserializableWithSecretModule:
+        pass
+
+    os.environ["AI_TRACER_TEST_SECRET"] = "super-secret-key-12345"
+    SampleUnserializableWithSecretModule.__module__ = os.environ["AI_TRACER_TEST_SECRET"]
+
+    def sample_function_returning_unserializable_object():
+        return SampleUnserializableWithSecretModule()
+
+    try:
+        tracer.start("tests")
+        sample_function_returning_unserializable_object()
+        calls = tracer.stop()
+    finally:
+        del os.environ["AI_TRACER_TEST_SECRET"]
+
+    assert calls[0]["return_value"] == "<redacted:env>"
+    assert calls[0]["return_serialization"] == "repr"
+
+
+def test_does_not_redact_a_generic_named_env_var_as_a_substring():
+    # A CI-provided var like GITHUB_JOB=test or GITHUB_REF_NAME=main is short
+    # and common enough that scanning for it as a substring would falsely
+    # redact ordinary values (e.g. this file's own module name, "test_tracer",
+    # contains "test"). Only secret-looking variable *names* get scanned.
+    os.environ["SOME_CI_JOB_NAME"] = "test"
+    try:
+        tracer.start("tests")
+        sample_function_taking_a_secret("test_tracer_helper")
+        calls = tracer.stop()
+    finally:
+        del os.environ["SOME_CI_JOB_NAME"]
+
+    assert calls[0]["args"]["value"] == "test_tracer_helper"
+
+
+def test_does_not_redact_a_generic_named_env_var_as_an_exact_match():
+    # A function plainly named "main" is the most common Python entry-point
+    # name; GITHUB_REF_NAME=main on the default branch must not redact it (or
+    # any other value) via exact match either, since the variable's name
+    # doesn't look secret-like. Only secret-named vars get any protection.
+    os.environ["SOME_CI_JOB_NAME"] = "test"
+    try:
+        tracer.start("tests")
+        sample_function_taking_a_secret("test")
+        calls = tracer.stop()
+    finally:
+        del os.environ["SOME_CI_JOB_NAME"]
+
+    assert calls[0]["args"]["value"] == "test"
+
+
+def test_does_not_redact_pwd_oldpwd_or_ssh_auth_sock_values():
+    # PWD/OLDPWD (current/previous shell directory) and SSH_AUTH_SOCK (an
+    # ssh-agent socket path) are present in nearly every real environment
+    # and would otherwise incidentally match the "pwd"/"auth" secret-name
+    # markers; they must be excluded explicitly rather than treated as
+    # secret-holding variables.
+    original = {
+        name: os.environ.get(name) for name in ("PWD", "OLDPWD", "SSH_AUTH_SOCK")
+    }
+    os.environ["PWD"] = "/Users/example/project"
+    os.environ["OLDPWD"] = "/Users/example/other"
+    os.environ["SSH_AUTH_SOCK"] = "/tmp/ssh-agent.1234"
+    try:
+        tracer.start("tests")
+        sample_function_taking_a_secret("/Users/example/project/file.py")
+        calls = tracer.stop()
+    finally:
+        for name, value in original.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    assert calls[0]["args"]["value"] == "/Users/example/project/file.py"
