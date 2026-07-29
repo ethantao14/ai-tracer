@@ -5,11 +5,12 @@ inputs (edge cases, boundary values, error conditions). Expected values are
 verified by calling the real traced function -- the LLM only proposes inputs,
 it never provides expected outputs that go unverified.
 
-Covers plain, top-level functions outside the entry script. An AI-proposed
-input that raises during verification is rendered as a pytest.raises(...)
-test when the raised exception class is referenceable (importable by a
-plain module.Name path); otherwise it's skipped. Entry-script functions
-aren't supported yet.
+Covers plain, top-level functions, including the entry script's own
+top-level functions when its path is provided. An AI-proposed input that
+raises during verification is rendered as a pytest.raises(...) test when
+the raised exception class is referenceable (importable by a plain
+module.Name path, or defined in the entry script itself); otherwise it's
+skipped.
 
 Configurable via env vars:
   OPENAI_API_KEY  -- API key (required for OpenAI)
@@ -51,6 +52,7 @@ def generate_ai_tests(
     api_key=None,
     base_url=None,
     model=None,
+    entry_script=None,
 ):
     """Generate AI-powered test cases from a trace log.
 
@@ -61,12 +63,15 @@ def generate_ai_tests(
         api_key: LLM API key (defaults to OPENAI_API_KEY env var).
         base_url: LLM API base URL (defaults to OPENAI_BASE_URL env var).
         model: LLM model name (defaults to AI_TRACER_MODEL env var or gpt-4o-mini).
+        entry_script: Path to the entry script (for __main__ functions).
 
     Returns:
         List of paths to generated test files.
     """
     calls = json.loads(Path(trace_log_path).read_text())
     target_dir = str(Path(target_dir).resolve())
+    if entry_script is not None:
+        entry_script = str(Path(entry_script).resolve())
     output_path = Path(output_dir).resolve()
 
     calls_by_module = {}
@@ -84,11 +89,19 @@ def generate_ai_tests(
             sys.modules.pop(name, None)
 
     try:
-        # No entry_script is ever passed to generator._skip_reason, so an
-        # entry-script ("__main__") function is skipped the same way it
-        # already is when generate() itself isn't given one -- not
-        # supported by AI generation yet.
+        # "__main__" calls are set aside and classified in a second pass,
+        # after every other module. Resolving them means loading the entry
+        # script (see below), which runs its top-level code -- including
+        # any unconditional statements outside `if __name__ == "__main__":`
+        # (e.g. `import helper; helper.x = 1`), which can mutate a sibling
+        # module before it's ever verified here. Handling "__main__" last
+        # means every other module's live verification calls still see the
+        # same fresh state a real, separate test-collection run would.
+        main_calls = []
         for call in calls:
+            if call["module"] == "__main__":
+                main_calls.append(call)
+                continue
             reason = generator._skip_reason(call, module_cache, signature_cache)
             if reason is None:
                 calls_by_module.setdefault(call["module"], []).append(call)
@@ -122,8 +135,8 @@ def generate_ai_tests(
 
         used_names = {}
         written_paths = []
-        for module_name in sorted(calls_by_module):
-            module_calls = calls_by_module[module_name]
+
+        def _write_module_tests(module_name, module_calls):
             test_cases_by_function = _generate_for_module(
                 module_name,
                 module_calls,
@@ -135,10 +148,10 @@ def generate_ai_tests(
                 model,
             )
             if not test_cases_by_function:
-                continue
+                return
 
             test_code = _render_test_module(
-                module_name, test_cases_by_function, target_dir
+                module_name, test_cases_by_function, target_dir, entry_script
             )
             base = f"test_{module_name.replace('.', '_')}_ai"
             file_name = f"{base}.py"
@@ -150,6 +163,28 @@ def generate_ai_tests(
             test_path = output_path / file_name
             test_path.write_text(test_code)
             written_paths.append(test_path)
+
+        for module_name in sorted(calls_by_module):
+            _write_module_tests(module_name, calls_by_module[module_name])
+
+        # Only loaded now, and only if there's actually a "__main__" call to
+        # resolve -- see the comment above the first pass for why loading it
+        # any earlier would risk corrupting a sibling module's verification.
+        if main_calls:
+            if entry_script is not None:
+                module_cache["__main__"] = generator._load_entry_module(entry_script)
+            entry_module_calls = []
+            for call in main_calls:
+                reason = generator._skip_reason(call, module_cache, signature_cache)
+                if reason is None:
+                    entry_module_calls.append(call)
+                else:
+                    print(
+                        f"Skipping AI test for {call['module']}.{call['qualname']}: {reason}",
+                        file=sys.stderr,
+                    )
+            if entry_module_calls:
+                _write_module_tests("__main__", entry_module_calls)
     finally:
         sys.path[:] = original_sys_path
         sys.modules.clear()
@@ -514,11 +549,24 @@ def _is_referenceable_exception(exc_type, module_cache):
         return False
     if exc_type.__module__ == "builtins":
         return getattr(builtins, exc_type.__name__, None) is exc_type
-    if exc_type.__module__ == "__main__":
-        # Entry-script exceptions aren't supported yet -- module_cache never
-        # has "__main__" populated here (no entry_script is ever passed to
-        # generate_ai_tests), so this is always unreferenceable for now.
-        return False
+    if exc_type.__module__ in ("__main__", generator._ENTRY_MODULE_IMPORT_NAME):
+        # A class defined while the entry script executed has that synthetic
+        # load name as __module__, not "__main__" -- the patch to "__main__"
+        # (see generator._load_entry_module) happens only after exec_module
+        # returns. Either way it's resolved through the same cached entry
+        # module object, not a doomed standalone import of that name.
+        #
+        # An ordinary target module actually named
+        # generator._ENTRY_MODULE_IMPORT_NAME would have its own exceptions
+        # under-referenced here too (the identity check below just always
+        # fails for it, so it's skipped rather than misattributed to the
+        # entry module) -- accepted, same as the target-local "pytest"/
+        # "conftest" name reservations elsewhere: this name is effectively
+        # reserved for ai-tracer's own internal use.
+        module = module_cache.get("__main__")
+        return (
+            module is not None and getattr(module, exc_type.__name__, None) is exc_type
+        )
     if not all(
         generator._is_valid_import_name(part) for part in exc_type.__module__.split(".")
     ):
@@ -552,7 +600,9 @@ def _call_real_function(module_name, qualname, args, module_cache):
         return None, type(exc)
 
 
-def _render_test_module(module_name, test_cases_by_function, target_dir):
+def _render_test_module(
+    module_name, test_cases_by_function, target_dir, entry_script=None
+):
     function_names = sorted(test_cases_by_function.keys())
     all_tests = [
         (args, result, exc_type)
@@ -565,11 +615,24 @@ def _render_test_module(module_name, test_cases_by_function, target_dir):
         exc_type is not None and exc_type.__module__ == "builtins"
         for _, _, exc_type in all_tests
     )
+    is_entry_script = module_name == "__main__"
+    # A class defined while the entry script executed (under its synthetic
+    # load name, see generator._load_entry_module) has that name as
+    # __module__, not "__main__" -- but it's only reachable through the
+    # same cached entry module object, so it's referenced the same way as a
+    # "__main__" exception, not via a doomed standalone import of that
+    # synthetic name.
+    entry_exception_modules = ("__main__", generator._ENTRY_MODULE_IMPORT_NAME)
+    needs_entry_module = is_entry_script or any(
+        exc_type is not None and exc_type.__module__ in entry_exception_modules
+        for _, _, exc_type in all_tests
+    )
     exception_modules = sorted(
         {
             exc_type.__module__
             for _, _, exc_type in all_tests
-            if exc_type is not None and exc_type.__module__ != "builtins"
+            if exc_type is not None
+            and exc_type.__module__ not in (("builtins",) + entry_exception_modules)
         }
     )
 
@@ -587,6 +650,9 @@ def _render_test_module(module_name, test_cases_by_function, target_dir):
 
     pytest_alias = _reserve("pytest") if has_raises else None
     builtins_alias = _reserve("_raises_builtins") if has_builtin_raises else None
+    entry_util_alias = _reserve("_importlib_util") if needs_entry_module else None
+    entry_spec_var = _reserve("_entry_spec") if needs_entry_module else None
+    entry_module_var = _reserve("_entry_module") if needs_entry_module else None
     exception_aliases = {
         module: _reserve("_raises_" + module.replace(".", "_"))
         for module in exception_modules
@@ -602,8 +668,30 @@ def _render_test_module(module_name, test_cases_by_function, target_dir):
         )
     if has_builtin_raises:
         lines.append(f"import builtins as {builtins_alias}")
+    if needs_entry_module:
+        lines.append(f"import importlib.util as {entry_util_alias}")
     lines += ["", f"sys.path.insert(0, {target_dir!r})"]
-    lines.append(f"from {module_name} import {', '.join(function_names)}")
+
+    if needs_entry_module:
+        # Loaded under a synthetic name, not "__main__", so the entry
+        # script's own `if __name__ == "__main__":` guard doesn't re-run.
+        lines.append(
+            f"{entry_spec_var} = {entry_util_alias}.spec_from_file_location("
+            f"{generator._ENTRY_MODULE_IMPORT_NAME!r}, {entry_script!r})"
+        )
+        lines.append(
+            f"{entry_module_var} = {entry_util_alias}.module_from_spec({entry_spec_var})"
+        )
+        lines.append(f"{entry_spec_var}.loader.exec_module({entry_module_var})")
+        # Patched back to "__main__" after exec so a function reading
+        # __name__ at call time sees what it saw when traced.
+        lines.append(f'{entry_module_var}.__name__ = "__main__"')
+
+    if is_entry_script:
+        for name in function_names:
+            lines.append(f"{name} = {entry_module_var}.{name}")
+    else:
+        lines.append(f"from {module_name} import {', '.join(function_names)}")
     for module in exception_modules:
         lines.append(f"import {module} as {exception_aliases[module]}")
 
@@ -621,6 +709,8 @@ def _render_test_module(module_name, test_cases_by_function, target_dir):
             if exc_type is not None:
                 if exc_type.__module__ == "builtins":
                     exc_ref = f"{builtins_alias}.{exc_type.__name__}"
+                elif exc_type.__module__ in entry_exception_modules:
+                    exc_ref = f"{entry_module_var}.{exc_type.__name__}"
                 else:
                     exc_ref = (
                         f"{exception_aliases[exc_type.__module__]}.{exc_type.__name__}"
@@ -636,16 +726,19 @@ def _render_test_module(module_name, test_cases_by_function, target_dir):
 
 def main():
     argv = sys.argv[1:]
-    if len(argv) not in (2, 3):
+    if len(argv) not in (2, 3, 4):
         print(
             "usage: python -m ai_tracer.ai_generator <trace_log> <target_dir> "
-            "[output_dir]",
+            "[output_dir] [entry_script]",
             file=sys.stderr,
         )
         sys.exit(1)
     trace_log_path, target_dir, *rest = argv
     output_dir = rest[0] if len(rest) > 0 else "generated_tests"
-    for path in generate_ai_tests(trace_log_path, target_dir, output_dir):
+    entry_script = rest[1] if len(rest) > 1 else None
+    for path in generate_ai_tests(
+        trace_log_path, target_dir, output_dir, entry_script=entry_script
+    ):
         print(path)
 
 

@@ -801,10 +801,10 @@ def test_generates_a_passing_test_for_a_function_literally_named_pytest(tmp_path
     assert "1 passed" in result.stdout
 
 
-def test_skips_entry_script_functions(tmp_path):
-    # Entry-script ("__main__") functions aren't covered yet -- generate_ai_tests
-    # doesn't take an entry_script argument at all, so they're skipped the
-    # same way the deterministic generator skips them without one.
+def test_skips_entry_script_functions_without_an_entry_script_path(tmp_path):
+    # Entry-script ("__main__") functions can only be resolved with the
+    # entry script's own file path -- without it, they're skipped the same
+    # way the deterministic generator skips them without one.
     trace_path = _trace(
         tmp_path,
         "def add(a, b):\n    return a + b\n"
@@ -825,6 +825,253 @@ def test_skips_entry_script_functions(tmp_path):
         )
 
     assert written == []
+
+
+def test_positional_llm_options_still_reach_call_llm(tmp_path):
+    # entry_script is keyword-only in practice (it's the last parameter,
+    # after the pre-existing api_key/base_url/model) specifically so an
+    # older positional call passing api_key/base_url/model still lands in
+    # the right place instead of shifting into entry_script's slot.
+    (tmp_path / "helper.py").write_text("def add(a, b):\n    return a + b\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import add\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    add(1, 2)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    captured = {}
+
+    def fake_call_llm(prompt, **kwargs):
+        captured.update(kwargs)
+        return "add(a=0, b=0)\n"
+
+    with mock.patch.object(ai_generator, "_call_llm", side_effect=fake_call_llm):
+        output_dir = tmp_path / "generated_tests"
+        ai_generator.generate_ai_tests(
+            str(trace_path),
+            str(tmp_path),
+            str(output_dir),
+            "sk-test-key",
+            "https://example.invalid/v1",
+            "test-model",
+        )
+
+    assert captured["api_key"] == "sk-test-key"
+    assert captured["base_url"] == "https://example.invalid/v1"
+    assert captured["model"] == "test-model"
+
+
+def test_generates_a_test_for_an_entry_script_function(tmp_path):
+    program_source = (
+        "def add(a, b):\n"
+        "    return a + b\n"
+        "\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    add(1, 2)\n"
+    )
+    trace_path = _trace(tmp_path, program_source)
+    program_path = tmp_path / "program.py"
+
+    with mock.patch.object(ai_generator, "_call_llm", return_value="add(a=0, b=0)\n"):
+        output_dir = tmp_path / "generated_tests"
+        written = ai_generator.generate_ai_tests(
+            str(trace_path),
+            str(tmp_path),
+            str(output_dir),
+            entry_script=str(program_path),
+        )
+
+    assert written == [output_dir / "test___main___ai.py"]
+    source = (output_dir / "test___main___ai.py").read_text()
+    assert "_entry_module = _importlib_util.module_from_spec(_entry_spec)" in source
+    assert "add = _entry_module.add" in source
+    assert "result = add(a=0, b=0)" in source
+    assert "assert result == 0" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir / "test___main___ai.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_generates_a_pytest_raises_test_for_an_entry_script_exception(tmp_path):
+    # LocalError is defined at the entry script's top level (not nested
+    # inside a function), so it's referenceable through the reloaded entry
+    # module the same way a top-level function is.
+    program_source = (
+        "class LocalError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def check(x):\n"
+        "    if x < 0:\n"
+        "        raise LocalError('negative')\n"
+        "    return x\n"
+        "\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    check(1)\n"
+    )
+    trace_path = _trace(tmp_path, program_source)
+    program_path = tmp_path / "program.py"
+
+    with mock.patch.object(ai_generator, "_call_llm", return_value="check(x=-1)\n"):
+        output_dir = tmp_path / "generated_tests"
+        written = ai_generator.generate_ai_tests(
+            str(trace_path),
+            str(tmp_path),
+            str(output_dir),
+            entry_script=str(program_path),
+        )
+
+    assert written == [output_dir / "test___main___ai.py"]
+    source = (output_dir / "test___main___ai.py").read_text()
+    assert "with pytest.raises(_entry_module.LocalError):" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir / "test___main___ai.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_generates_tests_for_both_a_helper_module_and_the_entry_script(tmp_path):
+    (tmp_path / "helper.py").write_text("def double(x):\n    return x * 2\n")
+    program_source = (
+        "from helper import double\n"
+        "\n"
+        "\n"
+        "def triple(x):\n"
+        "    return x * 3\n"
+        "\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    double(1)\n"
+        "    triple(1)\n"
+    )
+    trace_path = _trace(tmp_path, program_source)
+    program_path = tmp_path / "program.py"
+
+    def fake_call_llm(prompt, **kwargs):
+        if "Function: double" in prompt:
+            return "double(x=2)\n"
+        if "Function: triple" in prompt:
+            return "triple(x=2)\n"
+        return ""
+
+    with mock.patch.object(ai_generator, "_call_llm", side_effect=fake_call_llm):
+        output_dir = tmp_path / "generated_tests"
+        written = ai_generator.generate_ai_tests(
+            str(trace_path),
+            str(tmp_path),
+            str(output_dir),
+            entry_script=str(program_path),
+        )
+
+    assert sorted(p.name for p in written) == [
+        "test___main___ai.py",
+        "test_helper_ai.py",
+    ]
+
+    # Just the two AI files, not the whole dir -- _trace's own cli.py run
+    # already wrote the deterministic tests for the same functions there.
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", *(str(p) for p in written)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout
+
+
+def test_a_helper_module_is_verified_before_the_entry_script_can_mutate_it(tmp_path):
+    # The entry script mutates helper.x unconditionally at its own top
+    # level, outside any `if __name__ == "__main__":` guard, so it runs
+    # every time the script is loaded/executed -- including when it's
+    # reloaded purely to resolve the entry script's own AI tests. If that
+    # reload happened before helper's AI test was verified, the verification
+    # call would see helper.x already mutated to 1, but the rendered
+    # test_helper_ai.py only does a fresh `from helper import f`, which
+    # would see the unmutated x == 0 -- asserting a value that never
+    # actually happens in a real test run.
+    (tmp_path / "helper.py").write_text("x = 0\n\n\ndef f():\n    return x\n")
+    program_source = (
+        "import helper\n"
+        "\n"
+        "helper.x = 1\n"
+        "\n"
+        "\n"
+        "def entry_func():\n"
+        "    return 2\n"
+        "\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    helper.f()\n"
+        "    entry_func()\n"
+    )
+    trace_path = _trace(tmp_path, program_source)
+    program_path = tmp_path / "program.py"
+
+    def fake_call_llm(prompt, **kwargs):
+        if "Function: f" in prompt:
+            return "f()\n"
+        if "Function: entry_func" in prompt:
+            return "entry_func()\n"
+        return ""
+
+    with mock.patch.object(ai_generator, "_call_llm", side_effect=fake_call_llm):
+        output_dir = tmp_path / "generated_tests"
+        written = ai_generator.generate_ai_tests(
+            str(trace_path),
+            str(tmp_path),
+            str(output_dir),
+            entry_script=str(program_path),
+        )
+
+    assert sorted(p.name for p in written) == [
+        "test___main___ai.py",
+        "test_helper_ai.py",
+    ]
+    helper_source = (output_dir / "test_helper_ai.py").read_text()
+    assert "assert result == 0" in helper_source
+
+    # Standalone, not alongside test___main___ai.py: collecting that file
+    # too would independently re-run the entry script's mutation as part of
+    # *its own* module-level setup code, which is the already-documented,
+    # already-accepted "order-dependent shared state across files"
+    # limitation (see the README) -- a separate risk from the one this test
+    # targets, which is specifically about generation-time verification
+    # matching a fresh, standalone run of the rendered file.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            str(output_dir / "test_helper_ai.py"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
 
 
 def test_renders_tests_in_verification_order_not_alphabetically(tmp_path):

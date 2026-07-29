@@ -192,7 +192,7 @@ Not every recorded call becomes a test. A call is skipped, with a one-line reaso
 
 In addition to the deterministic trace-replay tests above, ai-tracer can use an LLM to generate test cases with varied inputs (edge cases, boundary values, error conditions). These are written to separate `test_<module>_ai.py` files alongside the deterministic ones, so the two never interfere.
 
-Currently covers plain, top-level functions outside the entry script. An input that raises during verification is rendered as a `pytest.raises(...)` test when the raised exception class is referenceable (importable via a plain `module.Name` path, e.g. not defined locally inside a function) - otherwise it's skipped rather than turned into a broken test. A function that's part of the entry script isn't covered yet either - that's planned for a later change.
+Covers plain, top-level functions, including the entry script's own top-level functions (via `--ai` on the CLI, which always has the entry script's path). An input that raises during verification is rendered as a `pytest.raises(...)` test when the raised exception class is referenceable (importable via a plain `module.Name` path, or defined in the entry script itself) - otherwise it's skipped rather than turned into a broken test.
 
 ### Enabling
 
