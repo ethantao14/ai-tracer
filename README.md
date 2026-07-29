@@ -192,7 +192,7 @@ Not every recorded call becomes a test. A call is skipped, with a one-line reaso
 
 In addition to the deterministic trace-replay tests above, ai-tracer can use an LLM to generate test cases with varied inputs (edge cases, boundary values, error conditions). These are written to separate `test_<module>_ai.py` files alongside the deterministic ones, so the two never interfere.
 
-Currently covers plain, top-level functions outside the entry script, where the AI-proposed input doesn't raise. An input that causes the function to raise during verification is skipped rather than turned into a test, and a function that's part of the entry script isn't covered yet either - both are planned for a later change.
+Currently covers plain, top-level functions outside the entry script. An input that raises during verification is rendered as a `pytest.raises(...)` test when the raised exception class is referenceable (importable via a plain `module.Name` path, e.g. not defined locally inside a function) - otherwise it's skipped rather than turned into a broken test. A function that's part of the entry script isn't covered yet either - that's planned for a later change.
 
 ### Enabling
 
@@ -243,6 +243,19 @@ def test_add_0():
 def test_add_1():
     result = add(a=-1, b=1)
     assert result == 0
+```
+
+An input that raises a referenceable exception is rendered with `pytest.raises(...)` instead:
+
+```python
+import pytest
+
+...
+
+
+def test_divide_1():
+    with pytest.raises(_raises_builtins.ZeroDivisionError):
+        divide(a=10, b=0)
 ```
 
 **Known limitation (order-dependent shared state, across files):** like the deterministic generator's own version of this limitation above, an AI test asserts a value that was verified by actually calling the function once during generation. If the target module has shared mutable state, that verification call and the deterministic test file's replay call are two independent calls against the same state, with no guaranteed order between `test_<module>.py` and `test_<module>_ai.py` when pytest runs both in one session - so an AI test can assert a value that no longer matches by the time it runs. This is a consequence of the deliberate choice to keep AI and deterministic tests in separate files (see "How it works" above); merging them into a single ordered file would remove the failure mode but wasn't the direction taken here.

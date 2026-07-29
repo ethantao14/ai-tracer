@@ -481,32 +481,22 @@ def test_skips_an_ai_proposed_input_whose_verified_result_is_not_renderable(tmp_
             "make(x=True)\n",
         ),
         (
-            "verification_raises",
-            # Exceptions aren't rendered as tests yet -- an input that
-            # raises during verification is skipped, not turned into a
-            # broken or misleading test.
-            "def divide(a, b):\n    return a / b\n",
-            "divide",
-            "divide(10, 2)",
-            "divide(a=10, b=0)\n",
-        ),
-        (
-            "verification_causes_sys_exit",
-            # SystemExit must still be caught gracefully (not propagate and
-            # abort generation), even though it isn't rendered as a test
-            # yet either.
+            "raised_exception_is_locally_defined",
+            # LocalError is defined inside f itself, so its __qualname__
+            # contains a dot -- it isn't reachable as a plain `module.Name`
+            # import the way pytest.raises(...) needs, so it must be
+            # skipped rather than rendered as a broken test.
             (
-                "import sys\n"
-                "\n"
-                "\n"
-                "def maybe_exit(x):\n"
+                "def f(x):\n"
+                "    class LocalError(Exception):\n"
+                "        pass\n"
                 "    if x:\n"
-                "        sys.exit(1)\n"
-                "    return 1\n"
+                "        raise LocalError('boom')\n"
+                "    return 0\n"
             ),
-            "maybe_exit",
-            "maybe_exit(False)",
-            "maybe_exit(x=True)\n",
+            "f",
+            "f(False)",
+            "f(x=True)\n",
         ),
         (
             "unrenderable_argument",
@@ -545,6 +535,270 @@ def test_skips_ai_proposed_calls_that_cannot_produce_a_safe_test(
         )
 
     assert written == []
+
+
+def test_generates_a_pytest_raises_test_for_a_builtin_exception(tmp_path):
+    (tmp_path / "helper.py").write_text("def divide(a, b):\n    return a / b\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import divide\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    divide(10, 2)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    with mock.patch.object(
+        ai_generator, "_call_llm", return_value="divide(a=10, b=0)\n"
+    ):
+        output_dir = tmp_path / "generated_tests"
+        written = ai_generator.generate_ai_tests(
+            str(trace_path), str(tmp_path), str(output_dir)
+        )
+
+    assert written == [output_dir / "test_helper_ai.py"]
+    source = (output_dir / "test_helper_ai.py").read_text()
+    assert "import pytest" in source
+    assert "import builtins as _raises_builtins" in source
+    assert "with pytest.raises(_raises_builtins.ZeroDivisionError):" in source
+    assert "divide(a=10, b=0)" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir / "test_helper_ai.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_a_target_pytest_module_does_not_shadow_the_real_pytest(tmp_path):
+    # If the target dir has its own pytest.py, "pytest" must not end up in
+    # the generated conftest's eviction set -- target_dir is ahead of the
+    # real pytest package on sys.path by then, so evicting the real
+    # sys.modules['pytest'] entry would make the rendered `import pytest`
+    # resolve to the target's fake module instead, breaking pytest.raises.
+    (tmp_path / "pytest.py").write_text(
+        "# a target module that isn't the real pytest\n"
+    )
+    (tmp_path / "helper.py").write_text("def divide(a, b):\n    return a / b\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import divide\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    divide(10, 2)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    # output dir beneath the target dir, so pytest picks up the generated
+    # conftest.py while also having the target's own pytest.py on sys.path.
+    output_dir = tmp_path / "generated_tests"
+    with mock.patch.object(
+        ai_generator, "_call_llm", return_value="divide(a=10, b=0)\n"
+    ):
+        written = ai_generator.generate_ai_tests(
+            str(trace_path), str(tmp_path), str(output_dir)
+        )
+
+    assert written == [output_dir / "test_helper_ai.py"]
+    assert "'pytest'" not in (output_dir / "conftest.py").read_text()
+
+    # conftest.py applies to any test file pytest discovers beneath it, so
+    # targeting just the AI test file (not the whole dir, which also has the
+    # deterministic tests _trace's own cli.py run wrote) is enough here.
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir / "test_helper_ai.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_generates_a_pytest_raises_test_for_sys_exit(tmp_path):
+    # SystemExit is a legitimate outcome to verify, not just an error to
+    # catch and skip -- a target calling sys.exit() must render the same
+    # way any other referenceable builtin exception does.
+    (tmp_path / "helper.py").write_text(
+        "import sys\n"
+        "\n"
+        "\n"
+        "def maybe_exit(x):\n"
+        "    if x:\n"
+        "        sys.exit(1)\n"
+        "    return 1\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import maybe_exit\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    maybe_exit(False)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    with mock.patch.object(
+        ai_generator, "_call_llm", return_value="maybe_exit(x=True)\n"
+    ):
+        output_dir = tmp_path / "generated_tests"
+        written = ai_generator.generate_ai_tests(
+            str(trace_path), str(tmp_path), str(output_dir)
+        )
+
+    assert written == [output_dir / "test_helper_ai.py"]
+    source = (output_dir / "test_helper_ai.py").read_text()
+    assert "with pytest.raises(_raises_builtins.SystemExit):" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir / "test_helper_ai.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_generates_a_pytest_raises_test_for_an_exception_from_another_module(tmp_path):
+    (tmp_path / "errors.py").write_text("class CustomError(Exception):\n    pass\n")
+    (tmp_path / "helper.py").write_text(
+        "from errors import CustomError\n"
+        "\n"
+        "\n"
+        "def check(x):\n"
+        "    if x < 0:\n"
+        "        raise CustomError('negative')\n"
+        "    return x\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import check\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    check(1)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    with mock.patch.object(ai_generator, "_call_llm", return_value="check(x=-1)\n"):
+        output_dir = tmp_path / "generated_tests"
+        written = ai_generator.generate_ai_tests(
+            str(trace_path), str(tmp_path), str(output_dir)
+        )
+
+    assert written == [output_dir / "test_helper_ai.py"]
+    source = (output_dir / "test_helper_ai.py").read_text()
+    assert "import errors as _raises_errors" in source
+    assert "with pytest.raises(_raises_errors.CustomError):" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir / "test_helper_ai.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_generates_both_a_return_and_a_raises_test_for_the_same_function(tmp_path):
+    (tmp_path / "helper.py").write_text("def divide(a, b):\n    return a / b\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import divide\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    divide(10, 2)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    with mock.patch.object(
+        ai_generator,
+        "_call_llm",
+        return_value="divide(a=10, b=2)\ndivide(a=10, b=0)\n",
+    ):
+        output_dir = tmp_path / "generated_tests"
+        written = ai_generator.generate_ai_tests(
+            str(trace_path), str(tmp_path), str(output_dir)
+        )
+
+    assert written == [output_dir / "test_helper_ai.py"]
+    source = (output_dir / "test_helper_ai.py").read_text()
+    assert "def test_divide_0():" in source
+    assert "assert result == 5.0" in source
+    assert "def test_divide_1():" in source
+    assert "with pytest.raises(_raises_builtins.ZeroDivisionError):" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir / "test_helper_ai.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout
+
+
+def test_generates_a_passing_test_for_a_function_literally_named_pytest(tmp_path):
+    # A traced function named `pytest` would otherwise collide with the
+    # `import pytest` this file needs once any exception is rendered.
+    (tmp_path / "helper.py").write_text("def pytest(a, b):\n    return a / b\n")
+    trace_path = _trace(
+        tmp_path,
+        "from helper import pytest\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    pytest(10, 2)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    with mock.patch.object(
+        ai_generator, "_call_llm", return_value="pytest(a=10, b=0)\n"
+    ):
+        output_dir = tmp_path / "generated_tests"
+        written = ai_generator.generate_ai_tests(
+            str(trace_path), str(tmp_path), str(output_dir)
+        )
+
+    assert written == [output_dir / "test_helper_ai.py"]
+    source = (output_dir / "test_helper_ai.py").read_text()
+    assert "import pytest as _pytest" in source
+    assert "with _pytest.raises(_raises_builtins.ZeroDivisionError):" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir / "test_helper_ai.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
 
 
 def test_skips_entry_script_functions(tmp_path):
