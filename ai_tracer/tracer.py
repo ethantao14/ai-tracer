@@ -13,12 +13,9 @@ _JSON_SAFE_SCALAR_TYPES = (str, bool, type(None))
 _SECRET_NAME_MARKERS = (
     "key", "token", "secret", "password", "pwd", "credential", "auth", "api",
 )
-# Well-known non-secret vars that would otherwise incidentally match a marker
-# above (PWD/OLDPWD via "pwd", SSH_AUTH_SOCK via "auth") - present in nearly
-# every shell session, holding the current directory or an agent socket path,
-# not a credential. Excluded by exact name (case-insensitive) rather than
-# narrowing the markers themselves, which would also miss real vars like
-# DB_PWD or SSH_AUTH_SOCK-style names for genuine secrets.
+# Non-secret vars that would otherwise match a marker above (PWD via "pwd",
+# SSH_AUTH_SOCK via "auth"). Excluded by exact name so real vars like
+# DB_PWD or SSH_AUTH_SOCK-style secret names still match the markers.
 _NON_SECRET_NAMES = {"pwd", "oldpwd", "ssh_auth_sock"}
 
 _target_dir = None
@@ -46,19 +43,13 @@ def _call_stack():
 
 
 def _should_redact(value, *, allow_substring=True):
-    # Fast path: exact match against a known secret-named env value (O(1)
-    # set lookup, no length floor - even a short secret like a 2-char PIN
-    # must be caught). Always active, even for structural metadata: a target
-    # that rebinds __name__ or an exception's __module__/__qualname__ (all
-    # writable attributes) to an env value directly must still have it caught.
+    # Fast path: exact match, no length floor - even a short secret like a
+    # 2-char PIN must be caught. Always active, even for structural metadata
+    # (a target could rebind __name__ to an env value directly).
     matched = value in _env_values
-    # Slow path: substring scan, over a length-filtered subset. Skipped for
-    # metadata (allow_substring=False) since that's what causes false-positive
-    # collisions on legitimate short identifiers, e.g. an env var literally
-    # "main" inside "__main__". The length filter here (unlike the exact-match
-    # set above) is deliberate: scanning for a 1-2 char env value as a
-    # substring would flag almost every string, so short values only ever
-    # get exact-match protection, not substring-scan protection.
+    # Slow path: substring scan, over a length-filtered subset - a 1-2 char
+    # value would flag almost every string. Skipped for metadata
+    # (allow_substring=False), e.g. an env var literally "main" inside "__main__".
     if (
         not matched
         and allow_substring
@@ -95,14 +86,8 @@ def _to_json_safe(value, *, allow_substring=True):
             ) from None
         return value
     # `is` (not `in`, which uses ==) so a custom metaclass __eq__ can't
-    # run target code or lie its way past this check.
-    # `allow_substring=False` is for structural metadata (module/qualname/
-    # exception names): exact-match redaction still applies (a target can
-    # rebind __name__ or an exception's __module__/__qualname__ - both
-    # writable attributes - directly to a secret), but substring scanning is
-    # skipped since that's what causes a false-positive collision with a
-    # legitimate short identifier (e.g. an env var literally "main" inside
-    # "__main__"), which would corrupt the record instead of protecting it.
+    # run target code or lie its way past this check. `allow_substring=False`
+    # here is for structural metadata, same reasoning as _should_redact above.
     if value_type is str and _should_redact(value, allow_substring=allow_substring):
         return "<redacted:env>"
     if any(value_type is safe_type for safe_type in _JSON_SAFE_SCALAR_TYPES):
@@ -143,12 +128,9 @@ def _snapshot(value, *, allow_substring=True):
         if _should_redact(fallback, allow_substring=allow_substring):
             return "<redacted:env>", "repr"
         return fallback, "repr"
-    # A value containing a redaction anywhere (top-level or nested) is no
-    # longer equivalent to what actually ran, so it's tagged "repr" the same
-    # as a non-JSON-safe value: the generator already skips replaying
-    # anything tagged "repr" rather than treating it as a literal to reuse.
-    # (Callers snapshotting metadata like module/exception names discard
-    # this tag entirely, so it has no effect there either way.)
+    # A value containing a redaction anywhere is no longer equivalent to
+    # what actually ran, so it's tagged "repr" - the generator already
+    # skips replaying anything tagged "repr" rather than reusing it as a literal.
     if getattr(_redaction_flag, "hit", False):
         return safe_value, "repr"
     return safe_value, "json"
@@ -230,11 +212,9 @@ def _trace_calls(frame):
 
 
 def _make_local_tracer(record, previous_local):
-    # Stays the local tracer for the frame's whole lifetime (we need our own
-    # "return" event to pop the call stack), forwarding every event to
-    # whatever tracer was previously chained in on top of our own bookkeeping.
-    # `record` is mutated in place rather than looked up via `_calls[call_id]`:
-    # two threads can both obtain a call_id before either appends its record.
+    # Stays the local tracer for the frame's whole lifetime, forwarding every
+    # event to whatever tracer was previously chained in. `record` is mutated
+    # in place: two threads can obtain a call_id before either appends its record.
     state = {"previous_local": previous_local, "saw_exception": False, "exc_type": None}
 
     def handler(frame, event, arg):
@@ -315,19 +295,9 @@ def start(target_dir):
     # calling thread's view, so a worker's leftover stack from a previous
     # start()/stop() cycle could otherwise leak into this run.
     _thread_local = threading.local()
-    # Snapshot env var values at start time so _should_redact can catch
-    # them in args/return values without intercepting os.environ access.
-    # Both exact-match and substring redaction are restricted to variables
-    # whose *name* looks secret-like: a generic CI-provided var
-    # (GITHUB_JOB=test, GITHUB_REF_NAME=main, RUNNER_OS=Linux) holds a short,
-    # extremely common value that collides constantly with ordinary code -
-    # not just as a substring ("test_tracer"'s own module name contains
-    # "test"), but as an exact match too (a function plainly named `main`,
-    # the single most common Python entry-point name, exactly equals
-    # GITHUB_REF_NAME's value on the default branch). Restricting to
-    # secret-looking names (key/token/secret/password/pwd/credential/
-    # auth/api) keeps redaction scoped to values actually meant to be
-    # sensitive, matching the convention real secrets are named under.
+    # Snapshot env var values so _should_redact can catch them without
+    # intercepting os.environ access. Restricted to secret-looking names -
+    # a generic CI var like GITHUB_REF_NAME=main would otherwise collide constantly.
     _env_values = {
         value
         for name, value in os.environ.items()

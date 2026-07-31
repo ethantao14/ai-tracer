@@ -89,14 +89,9 @@ def generate_ai_tests(
             sys.modules.pop(name, None)
 
     try:
-        # "__main__" calls are set aside and classified in a second pass,
-        # after every other module. Resolving them means loading the entry
-        # script (see below), which runs its top-level code -- including
-        # any unconditional statements outside `if __name__ == "__main__":`
-        # (e.g. `import helper; helper.x = 1`), which can mutate a sibling
-        # module before it's ever verified here. Handling "__main__" last
-        # means every other module's live verification calls still see the
-        # same fresh state a real, separate test-collection run would.
+        # "__main__" calls are set aside and classified last: resolving them
+        # loads the entry script, which runs its top-level code and could
+        # mutate a sibling module before it's ever verified here.
         main_calls = []
         for call in calls:
             if call["module"] == "__main__":
@@ -116,12 +111,9 @@ def generate_ai_tests(
         # depend on sibling modules that were just imported.
         output_path.mkdir(exist_ok=True, parents=True)
 
-        # generator.generate(ai=True) already writes this conftest.py as
-        # part of its own deterministic-generation step, but generate_ai_tests()
-        # is also independently callable (its own CLI, or directly) without
-        # going through generate() first -- written here too so that path
-        # gets the same one-time sys.path/eviction setup its own generated
-        # tests rely on, instead of a bare sys.path.insert with no eviction.
+        # generate() already writes this conftest.py, but generate_ai_tests()
+        # is also independently callable without going through generate()
+        # first -- written here too so that path gets the same eviction setup.
         conftest_path = output_path / "conftest.py"
         if not generator._would_clobber(conftest_path):
             conftest_path.write_text(generator._render_conftest(target_dir))
@@ -247,10 +239,9 @@ def _generate_for_module(
         verified_tests = []
         for args in proposed_inputs:
             if not all(_is_renderable(value) for value in args.values()):
-                # e.g. the LLM proposed x=1e309, which ast.literal_eval
-                # happily parses as float('inf') -- a real Python value,
-                # but its repr ('inf') isn't a literal the generated test
-                # could embed as an argument.
+                # e.g. the LLM proposed x=1e309, which ast.literal_eval parses
+                # as float('inf') -- a real value, but its repr ('inf') isn't
+                # a literal the generated test could embed as an argument.
                 print(
                     f"Skipping AI test for {module_name}.{qualname}({args}): "
                     "a proposed argument can't be rendered as a literal",
@@ -286,10 +277,8 @@ def _generate_for_module(
                 )
                 continue
             # A deep copy: if `result` is a mutable object the target keeps
-            # a reference to (e.g. a module-level list it returns), a later
-            # verification call could mutate it in place before this test
-            # case is ever rendered, silently changing the value already
-            # accepted here for an earlier call.
+            # a reference to, a later verification call could mutate it in
+            # place before this test case is rendered, changing the value.
             verified_tests.append((args, copy.deepcopy(result), None))
 
         if verified_tests:
@@ -313,13 +302,9 @@ def _equals_default(value, default):
 
 
 def _redact_default_valued_args(args, signature):
-    # The trace records every parameter present in the call frame, including
-    # ones the caller left at their default (it can't tell the two apart --
-    # see the README's "default arguments" limitation), so an omitted
-    # argument's recorded value is the same source-embedded default the
-    # signature line already strips. Redact anything that matches a
-    # parameter's default before it ever reaches the "recorded calls"
-    # section of the prompt.
+    # The trace can't tell an omitted argument from one passed explicitly
+    # (see README's "default arguments" limitation), so an omitted arg's
+    # recorded value is a source default -- redact it before it reaches the prompt.
     redacted = {}
     for name, value in args.items():
         param = signature.parameters.get(name)
@@ -330,10 +315,9 @@ def _redact_default_valued_args(args, signature):
 
 
 def _contains_default(value, default):
-    # Beyond an exact match (`return token`), a default can be embedded in
-    # a larger value the function derives -- `'Bearer ' + token` (substring)
-    # or `{'token': token}` (nested in a container) -- so both are checked
-    # recursively, not just direct equality.
+    # Beyond an exact match, a default can be embedded in a larger derived
+    # value (`'Bearer ' + token`) or nested in a container (`{'token': token}`),
+    # so both are checked recursively, not just direct equality.
     if _equals_default(value, default):
         return True
     if isinstance(default, str) and isinstance(value, str) and default:
@@ -349,10 +333,9 @@ def _contains_default(value, default):
 
 
 def _leaf_default_values(default):
-    # Recursively yields every leaf scalar reachable inside a default value
-    # -- a container default (e.g. cfg={'token': 'secret'}) can have just
-    # one piece of it extracted and returned (`return cfg['token']`), which
-    # a check against the whole container as one unit would miss.
+    # Recursively yields every leaf scalar inside a default value -- a
+    # container default can have just one piece extracted and returned,
+    # which a check against the whole container as one unit would miss.
     if isinstance(default, dict):
         for key, value in default.items():
             yield from _leaf_default_values(key)
@@ -366,10 +349,8 @@ def _leaf_default_values(default):
 
 def _redact_default_valued_return(return_value, signature):
     # A function that echoes an omitted argument back out, directly or as
-    # part of a larger value (e.g. `def connect(token="secret"): return
-    # token` or `return "Bearer " + token`), would otherwise re-leak the
-    # exact same source-embedded default through its recorded return value,
-    # even though the argument itself is already redacted above.
+    # part of a larger value, would otherwise re-leak the same source
+    # default through its recorded return value even though the arg is redacted above.
     for param in signature.parameters.values():
         if param.default is inspect.Parameter.empty:
             continue
@@ -421,13 +402,8 @@ _openai_client_cls = None
 
 def _import_openai_client_cls(target_dir):
     # Cached: the import only needs to happen (and be shadow-guarded) once.
-    # target_dir can be on sys.path more than once by the time this runs --
-    # generate_ai_tests() inserts it, and the CLI's own run() already left
-    # an earlier copy there too (it doesn't restore sys.path for the target
-    # process's own atexit handlers) -- so every occurrence of it, not just
-    # sys.path[0], is set aside for this one import. Otherwise a target
-    # file/package literally named "openai" could resolve here instead of
-    # the real installed SDK.
+    # target_dir can be on sys.path more than once by now, so every occurrence
+    # is set aside for this import -- else a target package named "openai" wins.
     global _openai_client_cls
     if _openai_client_cls is not None:
         return _openai_client_cls
@@ -504,13 +480,8 @@ def _parse_response(response_text, qualname):
 
 
 # Types whose repr() ai-tracer trusts to be a faithful, re-runnable literal.
-# Anything else (a custom object, even one whose __repr__ happens to look
-# like a literal) is rejected -- the rendered assertion re-calls the
-# function and compares the result via `==`, so what matters is whether the
-# value itself is a literal, not whether its repr merely parses as one.
-# Checked by exact type, not isinstance: a subclass (e.g. a str subclass
-# overriding __eq__) can still repr like its builtin base but no longer
-# behave like one, which the rendered `== <literal>` assertion needs.
+# Checked by exact type, not isinstance: a subclass overriding __eq__ can
+# still repr like its builtin base but no longer behave like one for `==`.
 _RENDERABLE_TYPES = (type(None), bool, int, float, str, bytes)
 _RENDERABLE_CONTAINER_TYPES = (list, tuple, dict)
 
@@ -535,34 +506,21 @@ def _is_renderable(value):
 
 
 def _is_referenceable_exception(exc_type, module_cache):
-    # False for a local/nested exception class (defined inside a function,
-    # or as a nested class) -- its __qualname__ contains a dot, and it
-    # isn't reachable as a plain `module.Name` the way pytest.raises(...)
-    # needs.
+    # False for a local/nested exception class: its __qualname__ contains a
+    # dot, so it isn't reachable as a plain `module.Name` pytest.raises() needs.
     if "." in exc_type.__qualname__:
         return False
-    # The generated file embeds this as literal `import x.y as ...` /
-    # `alias.Name` source text, not just an importlib lookup -- a module
-    # path or name that isn't a valid identifier would be syntactically
-    # invalid there even though importlib itself could resolve it.
+    # The generated file embeds this as literal `import x.y as ...` source
+    # text, not just an importlib lookup -- an invalid identifier here would
+    # be syntactically invalid there even if importlib itself could resolve it.
     if not generator._is_valid_import_name(exc_type.__name__):
         return False
     if exc_type.__module__ == "builtins":
         return getattr(builtins, exc_type.__name__, None) is exc_type
     if exc_type.__module__ in ("__main__", generator._ENTRY_MODULE_IMPORT_NAME):
         # A class defined while the entry script executed has that synthetic
-        # load name as __module__, not "__main__" -- the patch to "__main__"
-        # (see generator._load_entry_module) happens only after exec_module
-        # returns. Either way it's resolved through the same cached entry
-        # module object, not a doomed standalone import of that name.
-        #
-        # An ordinary target module actually named
-        # generator._ENTRY_MODULE_IMPORT_NAME would have its own exceptions
-        # under-referenced here too (the identity check below just always
-        # fails for it, so it's skipped rather than misattributed to the
-        # entry module) -- accepted, same as the target-local "pytest"/
-        # "conftest" name reservations elsewhere: this name is effectively
-        # reserved for ai-tracer's own internal use.
+        # load name as __module__, not "__main__" -- either way it's resolved
+        # through the same cached entry module object, checked by identity below.
         module = module_cache.get("__main__")
         return (
             module is not None and getattr(module, exc_type.__name__, None) is exc_type
@@ -577,9 +535,8 @@ def _is_referenceable_exception(exc_type, module_cache):
 
 def _call_real_function(module_name, qualname, args, module_cache):
     # Call the real traced function with the AI-proposed arguments. The
-    # return value or raised exception's type becomes the expected outcome
-    # in the generated assertion -- never the LLM's claim about what the
-    # output should be.
+    # return value or raised exception's type becomes the expected outcome --
+    # never the LLM's claim about what the output should be.
     module = generator._get_module(module_name, module_cache)
     if module is None:
         return _UNRESOLVED, None
@@ -589,9 +546,8 @@ def _call_real_function(module_name, qualname, args, module_cache):
         return _UNRESOLVED, None
     try:
         # A deep copy, not the caller's own dict: if the target mutates a
-        # mutable argument in place (e.g. xs.append(...)), the caller's copy
-        # -- later rendered into the generated test -- must still reflect
-        # the originally proposed input, not what the call mutated it into.
+        # mutable argument in place, the version later rendered into the
+        # test must still reflect the originally proposed input.
         return function(**copy.deepcopy(args)), None
     except KeyboardInterrupt:
         raise
@@ -616,12 +572,9 @@ def _render_test_module(
         for _, _, exc_type in all_tests
     )
     is_entry_script = module_name == "__main__"
-    # A class defined while the entry script executed (under its synthetic
-    # load name, see generator._load_entry_module) has that name as
-    # __module__, not "__main__" -- but it's only reachable through the
-    # same cached entry module object, so it's referenced the same way as a
-    # "__main__" exception, not via a doomed standalone import of that
-    # synthetic name.
+    # A class defined while the entry script executed has its synthetic load
+    # name as __module__, not "__main__" -- but it's reachable through the
+    # same cached entry module object, so it's referenced the same way.
     entry_exception_modules = ("__main__", generator._ENTRY_MODULE_IMPORT_NAME)
     needs_entry_module = is_entry_script or any(
         exc_type is not None and exc_type.__module__ in entry_exception_modules
@@ -695,11 +648,9 @@ def _render_test_module(
     for module in exception_modules:
         lines.append(f"import {module} as {exception_aliases[module]}")
 
-    # Rendered in the same order functions were verified in (first-appearance
-    # order in the trace, preserved by dict insertion order), not
-    # alphabetically -- for a module with shared mutable state, an AI test
-    # was verified against a real call made in that order, and running the
-    # tests out of order would no longer match the value it asserts on.
+    # Rendered in first-appearance trace order, not alphabetically -- for
+    # shared mutable state, a test verified against a call made in that order
+    # would no longer match the value it asserts on if run out of order.
     for qualname in test_cases_by_function:
         tests = test_cases_by_function[qualname]
         for i, (args, result, exc_type) in enumerate(tests):
