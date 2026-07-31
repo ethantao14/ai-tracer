@@ -43,11 +43,9 @@ def _contains_array(value):
 
 
 def _is_generated_file(path):
-    # Only the first line is checked, so this stays cheap and can't be
-    # fooled by the marker text appearing lower in an unrelated file.
-    # Recognizes ai_generator's marker too (imported lazily to avoid a
-    # circular import at module load time), so a stale test_*_ai.py from a
-    # previous --ai run still gets cleaned up on a run without --ai.
+    # Only the first line is checked, so this stays cheap. Also recognizes
+    # ai_generator's marker (imported lazily to avoid a circular import), so
+    # a stale test_*_ai.py from a previous --ai run gets cleaned up too.
     from ai_tracer import ai_generator
 
     try:
@@ -71,16 +69,9 @@ def _is_importable_package_dir(path):
 
 
 def _local_module_names(target_dir):
-    # "conftest" and "pytest" are excluded even if the target defines a
-    # same-named file/package: evicting "conftest" mid-collection would
-    # delete the conftest pytest is importing, and evicting "pytest" would
-    # make a generated `import pytest` (used to render pytest.raises(...))
-    # resolve to the target's own module instead of the real package, since
-    # target_dir is on sys.path ahead of everything else by then. Same
-    # tradeoff as "conftest" above: a target that legitimately defines its
-    # own same-named module can't have it freshly re-imported here, since
-    # both names are reserved for pytest's own infrastructure by the time
-    # any of this runs.
+    # "conftest"/"pytest" are excluded even if the target defines a same-named
+    # module: evicting "conftest" mid-collection deletes the one pytest is
+    # importing, and evicting "pytest" breaks the generated `import pytest`.
     names = set()
     for entry in Path(target_dir).iterdir():
         if entry.is_file() and entry.suffix == ".py":
@@ -307,8 +298,7 @@ def _exception_skip_reason(call, module_cache):
 def _children_by_call_id(calls):
     # A call's direct children, keyed by its own call_id. Grouped over every
     # recorded call, not just generatable ones, so a lookup for any call_id
-    # in the trace resolves correctly regardless of whether that call itself
-    # ended up generatable.
+    # resolves correctly regardless of whether that call itself is generatable.
     children = {}
     for call in calls:
         parent_call_id = call["parent_call_id"]
@@ -318,11 +308,9 @@ def _children_by_call_id(calls):
 
 
 def _mock_skip_reason(call, module_cache):
-    # None if `call` is safe to stand in for as a mocked child (its recorded
-    # return value or exception can be reproduced without replaying the real
-    # call), else a reason. Doesn't look at the child's own arguments at all
-    # - mocking replaces the whole call, so what it was passed never matters,
-    # only what it handed back.
+    # None if `call`'s recorded return value/exception can be reproduced
+    # without replaying it, else a reason. Never looks at the child's own
+    # arguments - mocking replaces the whole call, only its outcome matters.
     if not call["qualname"].isidentifier():
         return "not a plain top-level function (method, nested function, or lambda)"
     if not isinstance(call["module"], str) or not all(
@@ -345,8 +333,7 @@ def _mock_skip_reason(call, module_cache):
 def _unmockable_child_reason(call, children_by_call_id, module_cache):
     # None if every direct child of `call` is a safe mock target, else a
     # reason naming the first one that isn't. Only direct children matter:
-    # mocking a child replaces its whole body, so anything nested inside it
-    # never runs during the generated test either.
+    # mocking one replaces its whole body, so nothing nested inside it runs.
     for child in children_by_call_id.get(call["call_id"], []):
         reason = _mock_skip_reason(child, module_cache)
         if reason is not None:
@@ -373,9 +360,8 @@ def _get_module(module_name, module_cache):
 
 
 def _load_entry_module(entry_script):
-    # Loaded under a synthetic name so the entry script's own
-    # `if __name__ == "__main__":` guard doesn't refire during exec_module;
-    # patched to the real "__main__" right after, so a function reading
+    # Loaded under a synthetic name so the entry script's own __main__ guard
+    # doesn't refire, patched to "__main__" right after so a function reading
     # __name__ at call time still sees what it saw when traced.
     try:
         spec = importlib.util.spec_from_file_location(
@@ -453,10 +439,9 @@ def _render_conftest(target_dir):
 
 
 def _mocked_child_groups(module_calls, children_by_call_id):
-    # call_id -> [(child qualname, [calls to it, in traced order]), ...],
-    # in first-appearance order, for every call in this module that has at
-    # least one direct child. A parent with no children is left out
-    # entirely, not mapped to an empty list.
+    # call_id -> [(child qualname, [calls to it, in traced order]), ...], for
+    # every call in this module with at least one direct child. A parent
+    # with no children is left out entirely, not mapped to an empty list.
     groups_by_call_id = {}
     for call in module_calls:
         children = children_by_call_id.get(call["call_id"], [])
@@ -508,10 +493,9 @@ def _render_test_module(
     # `errors` can't shadow them.
     reserved = set(imported_names)
     if any_mocked:
-        # "from unittest import mock" has no alias of its own (mocker.py's
-        # fixed rendering), so this only guards *other* reserved names from
-        # picking "mock" - a traced function literally named `mock` is a
-        # pre-existing, accepted collision with that fixed import.
+        # "from unittest import mock" has no alias of its own, so this only
+        # guards *other* reserved names from picking "mock" - a traced
+        # function literally named `mock` is an accepted collision.
         reserved.add("mock")
 
     def _reserve(base):
@@ -524,16 +508,13 @@ def _render_test_module(
     pytest_alias = _reserve("_raises_pytest") if has_raises else None
     builtins_alias = _reserve("_raises_builtins") if has_builtin_raises else None
     is_entry_script = module_name == "__main__"
-    # A mocked call's own module is used as the mock.patch() target, but
-    # "__main__" as a plain string would resolve to whatever this pytest
-    # process's real entry point is, not the reloaded copy - the synthetic
-    # name it's registered under below is used instead in that case.
+    # "__main__" as a plain mock.patch() target string would resolve to this
+    # pytest process's own entry point, not the reloaded copy - the synthetic
+    # name it's registered under is used instead in that case.
     mock_parent_module = _ENTRY_MODULE_IMPORT_NAME if is_entry_script else module_name
-    # A mocked child's raised exception can live in "__main__" even when
-    # this test file's own module doesn't - e.g. a helper module calling an
-    # entry-script function that raises - so entry_module_var may be needed
-    # here purely to name that exception, without the entry-script-reload
-    # machinery below driving imported_names too.
+    # A mocked child's raised exception can live in "__main__" even when this
+    # test file's own module doesn't (e.g. a helper calling an entry-script
+    # function that raises), so entry_module_var may be needed just to name it.
     needs_entry_module = is_entry_script or any(
         child["raised"] and child["exception_module"] == "__main__"
         for child in mocked_children
@@ -602,11 +583,9 @@ def _render_test_module(
         lines.append(f'{entry_module_var}.__name__ = "__main__"')
     if is_entry_script:
         if any_mocked:
-            # mock.patch() resolves its string target via sys.modules, and
-            # this process's real "__main__" is pytest's own entry point,
-            # not this reloaded copy - registered under the synthetic name
-            # instead so a mocked entry-script call's own children resolve
-            # to the copy actually running these tests.
+            # mock.patch() resolves its target via sys.modules, where the real
+            # "__main__" is pytest's own entry point, not this reloaded copy -
+            # registered under the synthetic name instead so mocks resolve here.
             lines.append(
                 f"sys.modules[{_ENTRY_MODULE_IMPORT_NAME!r}] = {entry_module_var}"
             )

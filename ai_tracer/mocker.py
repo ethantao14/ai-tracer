@@ -1,30 +1,6 @@
-# Renders a `unittest.mock.patch(...)` block that replaces a function's
-# direct child call with its recorded return value, so a generated test
-# exercises only the function under test - not whatever it happens to call.
-#
-# The patch target is the *calling* module's own name for the child
-# (`<parent module>.<child qualname>`), assuming the caller reached it via
-# a plain `from <child's module> import <name>` - i.e. bound it under its
-# own unaliased qualname. This is the standard "patch where it's looked up,
-# not where it's defined" idiom, and empirically it fails loudly rather
-# than silently in its main failure mode: if the caller instead reached the
-# child via `import <module>; <module>.<name>(...)`, the calling module has
-# no attribute of that name, so `mock.patch()` raises `AttributeError`
-# immediately - the generated test fails visibly instead of under-isolating.
-#
-# The alternative - patching the child's own defining module instead - covers
-# that case, but only if the calling module is reimported *after* the patch
-# is applied (a `from x import y` binding resolves at import time), which
-# would mean reimporting per test for any module that ends up needing a
-# mock. That breaks the "each shared module is imported once per session"
-# design the generated conftest.py already relies on, and its own failure
-# mode is silent (the stale, unpatched reference just keeps working) rather
-# than loud. Chosen against for both reasons.
-#
-# The one case patching-where-used still gets wrong silently: the calling
-# module happens to define or import an unrelated attribute under the same
-# name as the child's qualname, while reaching the real child via
-# module-attribute access elsewhere. Accepted as a rare edge case.
+# Renders a `mock.patch(...)` block replacing a function's direct child
+# call with its recorded return value. Patches under the calling module's
+# own name for the child - see README's "mock patch target" limitation for why.
 
 
 def render_import_line():
@@ -36,12 +12,9 @@ def mock_target(parent_module, calls):
 
 
 def _outcome(calls, exception_reference):
-    # A raised call can't be expressed as return_value at all, and a call
-    # made more than once needs its outcomes replayed in traced order - so
-    # only a single, non-raised call gets the plain return_value= form.
-    # (A bare exception class in a side_effect list is enough on its own to
-    # make the mock raise it - unittest.mock instantiates it with no args,
-    # same as pytest.raises(SomeError) names the type, not a message.)
+    # Only a single, non-raised call can use return_value=; anything raised
+    # or repeated needs side_effect= to replay outcomes in traced order.
+    # A bare exception class in side_effect is enough to make the mock raise it.
     if len(calls) == 1 and not calls[0]["raised"]:
         return f"return_value={calls[0]['return_value']!r}"
     if len(calls) == 1:
@@ -54,12 +27,9 @@ def _outcome(calls, exception_reference):
 
 
 def render_patch_clause(parent_module, calls, alias, exception_reference):
-    # `calls` holds every recorded call to one direct child, in traced call
-    # order - `mock.patch(...) as alias`, with no leading "with" and no
-    # trailing ":", so several children's clauses can share one `with`
-    # statement. `exception_reference(call)` must return a source
-    # expression naming the raised call's exception class (e.g.
-    # "ValueError" or "errors.AppError"); only called for a raised call.
+    # Renders "mock.patch(...) as alias" with no leading "with"/trailing ":"
+    # so several children's clauses can share one `with` statement.
+    # exception_reference(call) names the raised call's exception class.
     target = mock_target(parent_module, calls)
     return f"mock.patch({target!r}, {_outcome(calls, exception_reference)}) as {alias}"
 
