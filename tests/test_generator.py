@@ -363,8 +363,203 @@ def test_skips_a_method_call(tmp_path, capsys):
         str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
     )
 
-    assert "not a plain top-level function" in capsys.readouterr().err
+    assert "instance methods aren't supported yet" in capsys.readouterr().err
     assert not (tmp_path / "generated_tests" / "test_helper.py").exists()
+
+
+def test_generates_a_passing_test_for_a_staticmethod(tmp_path):
+    (tmp_path / "helper.py").write_text(
+        "class Widget:\n    @staticmethod\n    def double(x):\n        return x * 2\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import Widget\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    Widget.double(21)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    source = (output_dir / "test_helper.py").read_text()
+    assert "from helper import Widget" in source
+    assert "def test_Widget_double_0():" in source
+    assert "result = Widget.double(x=21)" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_skips_a_classmethod_call(tmp_path, capsys):
+    # Unlike a staticmethod, a classmethod's qualname always names the class
+    # it's *defined* on, not the one actually used to call it (a call through
+    # a subclass still traces as e.g. "Base.named" with cls bound to the
+    # subclass) - and the trace can't tell the two apart (cls's own repr()
+    # fallback carries no class name at all). Rendering through the
+    # defining class could silently assert the wrong class's behavior, so
+    # classmethods are skipped entirely for now, not just the inherited case.
+    (tmp_path / "helper.py").write_text(
+        "class Widget:\n"
+        "    @classmethod\n"
+        "    def named(cls, name):\n"
+        "        return f'{cls.__name__}:{name}'\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import Widget\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    Widget.named('a')\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    written = generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert written == []
+    assert "classmethods aren't supported yet" in capsys.readouterr().err
+
+
+def test_generated_test_names_dont_collide_between_a_function_and_a_method(tmp_path):
+    # "Widget.double" and a plain function literally named "Widget_double"
+    # sanitize to the same test function name once dots become underscores -
+    # without a fix, the second `def test_Widget_double_0():` silently
+    # shadows the first one instead of getting its own "_1" suffix.
+    (tmp_path / "helper.py").write_text(
+        "class Widget:\n"
+        "    @staticmethod\n"
+        "    def double(x):\n"
+        "        return x * 2\n"
+        "\n"
+        "\n"
+        "def Widget_double(x):\n"
+        "    return x * 3\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import Widget, Widget_double\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    Widget.double(21)\n"
+        "    Widget_double(21)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    source = (output_dir / "test_helper.py").read_text()
+    assert source.count("def test_Widget_double_") == 2
+    assert "def test_Widget_double_0():" in source
+    assert "def test_Widget_double_1():" in source
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout
+
+
+def test_generated_test_mocks_a_staticmethod_child_call(tmp_path):
+    (tmp_path / "util.py").write_text(
+        "class Widget:\n"
+        "    @staticmethod\n"
+        "    def inner(x):\n"
+        "        return x + 1\n"
+    )
+    (tmp_path / "helper.py").write_text(
+        "from util import Widget\n\n\ndef outer(x):\n    return Widget.inner(x) * 10\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import outer\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    outer(4)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    output_dir = tmp_path / "generated_tests"
+    generator.generate(str(trace_path), str(tmp_path), str(output_dir))
+
+    test_helper_path = output_dir / "test_helper.py"
+    source = test_helper_path.read_text()
+    assert "mock.patch('helper.Widget.inner', return_value=5) as" in source
+
+    # Break the real staticmethod after tracing (test_util.py, which calls
+    # it directly and isn't the point of this test, is expected to start
+    # failing once it's broken - only test_helper.py's own isolation matters
+    # here, same as the plain-function mocking test above).
+    (tmp_path / "util.py").write_text(
+        "class Widget:\n"
+        "    @staticmethod\n"
+        "    def inner(x):\n"
+        "        raise RuntimeError('the real inner ran')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", str(test_helper_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+
+
+def test_skips_a_call_to_a_property_shaped_like_a_method(tmp_path, capsys):
+    (tmp_path / "helper.py").write_text(
+        "class Widget:\n"
+        "    @property\n"
+        "    def value(self):\n"
+        "        return 1\n"
+    )
+    trace_path = _trace(
+        tmp_path,
+        "from helper import Widget\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    Widget().value\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n",
+    )
+
+    written = generator.generate(
+        str(trace_path), str(tmp_path), str(tmp_path / "generated_tests")
+    )
+
+    assert written == []
+    assert "is not a plain method" in capsys.readouterr().err
 
 
 def test_skips_a_function_with_a_positional_only_parameter(tmp_path, capsys):
@@ -1758,9 +1953,37 @@ def test_mock_skip_reason_rejects_an_unfinished_call():
 
 
 def test_mock_skip_reason_rejects_a_method_qualname():
+    import types
+
+    class Greeter:
+        def greet(self):
+            return "hi"
+
+    module = types.ModuleType("helper")
+    module.Greeter = Greeter
     call = _call(qualname="Greeter.greet")
+    reason = generator._mock_skip_reason(call, module_cache={"helper": module})
+    assert "instance methods aren't supported yet" in reason
+
+
+def test_mock_skip_reason_rejects_a_nested_function_qualname():
+    call = _call(qualname="outer.<locals>.inner")
     reason = generator._mock_skip_reason(call, module_cache={})
     assert "not a plain top-level function" in reason
+
+
+def test_mock_skip_reason_accepts_a_staticmethod_qualname():
+    import types
+
+    class Widget:
+        @staticmethod
+        def inner(x):
+            return x + 1
+
+    module = types.ModuleType("helper")
+    module.Widget = Widget
+    call = _call(qualname="Widget.inner", return_value=5)
+    assert generator._mock_skip_reason(call, module_cache={"helper": module}) is None
 
 
 def test_mock_skip_reason_rejects_an_invalid_module_name():
