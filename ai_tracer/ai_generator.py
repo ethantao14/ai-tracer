@@ -45,6 +45,17 @@ def _would_clobber(path):
     return path.exists() and not _is_generated_file(path)
 
 
+def _skip_reason(call, module_cache, signature_cache):
+    # AI test generation doesn't understand method qualnames yet (its own
+    # _render_test_module/_call_real_function below both assume a flat,
+    # importable name) - generator._skip_reason now accepts static/class
+    # methods for the deterministic generator, so that gate is reapplied
+    # here rather than letting a method reach an LLM call it can never use.
+    if not call["qualname"].isidentifier():
+        return "AI test generation for methods isn't supported yet"
+    return generator._skip_reason(call, module_cache, signature_cache)
+
+
 def generate_ai_tests(
     trace_log_path,
     target_dir,
@@ -97,7 +108,7 @@ def generate_ai_tests(
             if call["module"] == "__main__":
                 main_calls.append(call)
                 continue
-            reason = generator._skip_reason(call, module_cache, signature_cache)
+            reason = _skip_reason(call, module_cache, signature_cache)
             if reason is None:
                 calls_by_module.setdefault(call["module"], []).append(call)
             else:
@@ -167,7 +178,7 @@ def generate_ai_tests(
                 module_cache["__main__"] = generator._load_entry_module(entry_script)
             entry_module_calls = []
             for call in main_calls:
-                reason = generator._skip_reason(call, module_cache, signature_cache)
+                reason = _skip_reason(call, module_cache, signature_cache)
                 if reason is None:
                     entry_module_calls.append(call)
                 else:

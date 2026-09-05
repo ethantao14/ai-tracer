@@ -31,6 +31,86 @@ def _is_valid_import_name(part):
     return part.isidentifier() and not keyword.iskeyword(part)
 
 
+_MISSING = object()
+
+
+def _class_path_and_method(qualname):
+    # (class_path, method_name) if qualname looks like a class-attribute
+    # path (e.g. "Outer.Inner.method"), else None. A nested function or
+    # lambda's qualname always contains a "<...>" segment ("<locals>",
+    # "<lambda>"), which never passes _is_valid_import_name, so those stay
+    # correctly excluded here rather than misread as a class path.
+    parts = qualname.split(".")
+    if len(parts) < 2 or not all(_is_valid_import_name(part) for part in parts):
+        return None
+    return parts[:-1], parts[-1]
+
+
+def _resolve_class(module, class_path):
+    obj = module
+    for part in class_path:
+        try:
+            obj = getattr(obj, part)
+        except KeyboardInterrupt:
+            raise
+        except BaseException:  # noqa: BLE001 - target attribute access can raise anything
+            return None
+    return obj if isinstance(obj, type) else None
+
+
+def _resolve_attr_path(obj, dotted_name):
+    for part in dotted_name.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def _method_kind(cls, method_name):
+    # "static", "class", "instance", or None (not found, or something else
+    # entirely - a property, a nested class, etc). Uses getattr_static so
+    # the descriptor protocol doesn't fire: accessing a classmethod or
+    # staticmethod normally already resolves it to a bound/plain callable,
+    # losing the wrapper that distinguishes it from an ordinary method.
+    raw = inspect.getattr_static(cls, method_name, _MISSING)
+    if raw is _MISSING:
+        return None
+    if isinstance(raw, staticmethod):
+        return "static"
+    if isinstance(raw, classmethod):
+        return "class"
+    if inspect.isfunction(raw):
+        return "instance"
+    return None
+
+
+def _resolve_class_method(call, class_path, method_name, module_cache):
+    # (cls, kind, None) on success, else (None, None, reason).
+    module = _get_module(call["module"], module_cache)
+    if module is None:
+        return None, None, (
+            f"module {call['module']!r} could not be imported (it may raise on import)"
+        )
+    cls = _resolve_class(module, class_path)
+    if cls is None:
+        return None, None, (
+            f"class {'.'.join(class_path)!r} could not be resolved in module "
+            f"{call['module']!r}"
+        )
+    kind = _method_kind(cls, method_name)
+    if kind is None:
+        return None, None, (
+            f"{call['qualname']} is not a plain method (property, nested class, "
+            "or similar)"
+        )
+    return cls, kind, None
+
+
+def _top_level_import_name(qualname):
+    # The name that needs importing to make `qualname` referenceable: itself
+    # for a plain function, or the outermost class for a (possibly nested)
+    # class-attribute path.
+    return qualname.split(".", 1)[0]
+
+
 def _contains_array(value):
     # Lists and tuples both trace as JSON arrays, so a recorded array is
     # ambiguous: rendering it as a list could turn a tuple into one and
@@ -205,8 +285,13 @@ def generate(
 
 def _skip_reason(call, module_cache, signature_cache):
     # None if the call can be generated, else a reason printed to stderr.
-    if not call["qualname"].isidentifier():
-        return "not a plain top-level function (method, nested function, or lambda)"
+    qualname = call["qualname"]
+    class_path = method_name = None
+    if not qualname.isidentifier():
+        split = _class_path_and_method(qualname)
+        if split is None:
+            return "not a plain top-level function (method, nested function, or lambda)"
+        class_path, method_name = split
     # "__main__" can only be resolved to the traced script if generate()
     # was given its file path (module_cache is pre-populated in that case).
     if call["module"] == "__main__" and "__main__" not in module_cache:
@@ -223,7 +308,15 @@ def _skip_reason(call, module_cache, signature_cache):
         return (
             "call didn't finish before tracing stopped (e.g. an unjoined worker thread)"
         )
-    if any(kind != "json" for kind in call["arg_serialization"].values()):
+    if class_path is not None:
+        _cls, kind, reason = _resolve_class_method(call, class_path, method_name, module_cache)
+        if reason is not None:
+            return reason
+        if kind == "instance":
+            return "instance methods aren't supported yet (only staticmethod)"
+        if kind == "class":
+            return "classmethods aren't supported yet (only staticmethod)"
+    if any(kind_ != "json" for kind_ in call["arg_serialization"].values()):
         return "one or more arguments could not be captured as a JSON value"
     if any(_contains_array(value) for value in call["args"].values()):
         return "an argument contains a list/array (a tuple can't be told apart from a list in the trace yet)"
@@ -234,7 +327,9 @@ def _skip_reason(call, module_cache, signature_cache):
             return "return value contains a list/array (a tuple can't be told apart from a list in the trace yet)"
     # Checked before the exception's own module: if the two are involved in
     # a circular import, importing the function's module first can succeed
-    # where importing the exception module cold would fail.
+    # where importing the exception module cold would fail. (Already
+    # imported above when class_path is set - _get_module is cached, so
+    # this is free in that case.)
     if _get_module(call["module"], module_cache) is None:
         return (
             f"module {call['module']!r} could not be imported (it may raise on import)"
@@ -311,8 +406,13 @@ def _mock_skip_reason(call, module_cache):
     # None if `call`'s recorded return value/exception can be reproduced
     # without replaying it, else a reason. Never looks at the child's own
     # arguments - mocking replaces the whole call, only its outcome matters.
-    if not call["qualname"].isidentifier():
-        return "not a plain top-level function (method, nested function, or lambda)"
+    qualname = call["qualname"]
+    class_path = method_name = None
+    if not qualname.isidentifier():
+        split = _class_path_and_method(qualname)
+        if split is None:
+            return "not a plain top-level function (method, nested function, or lambda)"
+        class_path, method_name = split
     if not isinstance(call["module"], str) or not all(
         _is_valid_import_name(part) for part in call["module"].split(".")
     ):
@@ -321,6 +421,14 @@ def _mock_skip_reason(call, module_cache):
         return (
             "call didn't finish before tracing stopped (e.g. an unjoined worker thread)"
         )
+    if class_path is not None:
+        _cls, kind, reason = _resolve_class_method(call, class_path, method_name, module_cache)
+        if reason is not None:
+            return reason
+        if kind == "instance":
+            return "instance methods aren't supported yet as mock targets (only staticmethod)"
+        if kind == "class":
+            return "classmethods aren't supported yet as mock targets (only staticmethod)"
     if call["raised"]:
         return _exception_skip_reason(call, module_cache)
     if call["return_serialization"] == "repr":
@@ -385,7 +493,11 @@ def _get_signature(module_name, qualname, module_cache, signature_cache):
     if key not in signature_cache:
         module = _get_module(module_name, module_cache)
         try:
-            function = getattr(module, qualname)
+            # A dotted qualname (a static/classmethod's "ClassName.method")
+            # resolves the same way: getattr(module, "ClassName") then
+            # getattr(cls, "method") - the latter already gives the bound
+            # classmethod (cls excluded) or plain staticmethod function.
+            function = _resolve_attr_path(module, qualname)
             signature = inspect.signature(function)
         except KeyboardInterrupt:
             raise
@@ -462,9 +574,18 @@ def _mocked_child_groups(module_calls, children_by_call_id):
 
 
 def _render_test_module(
-    module_name, module_calls, target_dir, children_by_call_id, entry_script=None
+    module_name,
+    module_calls,
+    target_dir,
+    children_by_call_id,
+    entry_script=None,
 ):
-    imported_names = sorted({call["qualname"] for call in module_calls})
+    # A method's qualname ("ClassName.method") isn't itself importable - only
+    # the (outermost) class is; the call site still references the full
+    # dotted qualname, e.g. "ClassName.method(...)".
+    imported_names = sorted(
+        {_top_level_import_name(call["qualname"]) for call in module_calls}
+    )
     # Avoids colliding with a traced function named `result`, which would
     # otherwise turn `result = result(...)` into an UnboundLocalError.
     result_var = "result"
@@ -550,7 +671,7 @@ def _render_test_module(
         )
 
     mock_aliases = {
-        (call_id, qualname): _reserve(f"_mock_{qualname}")
+        (call_id, qualname): _reserve(f"_mock_{qualname.replace('.', '_')}")
         for call_id, groups in mocked_groups_by_call_id.items()
         for qualname, _ in groups
     }
@@ -603,12 +724,17 @@ def _render_test_module(
     call_counts = {}
     for call in module_calls:
         qualname = call["qualname"]
-        index = call_counts.get(qualname, 0)
-        call_counts[qualname] = index + 1
+        # Keyed by the sanitized name, not the raw qualname: a plain function
+        # literally named e.g. "A_B" and a method "A.B" would otherwise each
+        # start their own counter at 0 and collide on the same test function
+        # name once dots are replaced with underscores below.
+        test_name = qualname.replace(".", "_")
+        index = call_counts.get(test_name, 0)
+        call_counts[test_name] = index + 1
 
         args = ", ".join(f"{name}={value!r}" for name, value in call["args"].items())
         lines += ["", ""]
-        lines.append(f"def test_{qualname}_{index}():")
+        lines.append(f"def test_{test_name}_{index}():")
         if call["raised"]:
             reference = _exception_reference(
                 call, builtins_alias, exception_aliases, entry_module_var
